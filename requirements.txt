@@ -1,0 +1,13 @@
+websockets
+webrtcvad-wheels
+noisereduce
+numpy
+rapidfuzz
+chromadb
+sentence-transformers
+elevenlabs
+groq
+python-dotenv
+requests
+indic-num2words
+aiofiles

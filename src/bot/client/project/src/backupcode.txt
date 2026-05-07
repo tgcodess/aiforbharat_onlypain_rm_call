@@ -1,0 +1,41 @@
+async function getFilteredAudioStream() {
+    const AudioContext = window.AudioContext || window.webkitAudioContext;
+    const context = new AudioContext();
+
+    const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+            echoCancellation: {
+                ideal: true
+            },
+            noiseSuppression: false, //{ ideal: true },
+            autoGainControl: true //{ ideal: true }
+        }
+    });
+
+    const mediaStreamSource = context.createMediaStreamSource(stream);
+
+    const compressor = context.createDynamicsCompressor();
+    compressor.threshold.value = -50;
+    compressor.knee.value = 40;
+    compressor.ratio.value = 12;
+    // compressor.reduction.value = -20;
+    compressor.attack.value = 0;
+    compressor.release.value = 0.25;
+//
+    const filter = context.createBiquadFilter();
+    filter.type = 'bandpass';
+    filter.frequency.value = 350;
+    filter.Q.value = 1.0;
+    filter.gain.value = 3.0;
+//
+    mediaStreamSource.connect(filter);
+    filter.connect(compressor);
+
+    const dest = context.createMediaStreamDestination();
+    //compressor.connect(dest);
+
+    return {
+        filteredStream: dest.stream,
+        audioContext: context
+    };
+}

@@ -1,0 +1,15 @@
+2025-05-15 19:49:03.699 [128600786782016] :
+    USER INPUT: मैं शतिस साल का हूँ
+    Find out if user input is an answer to the question : आपका पूरा नाम,आयु,pincode क्या हैं ? . If it doesnt match, find the answer as per other instructions
+    EXTRACT ALL ANSWERS AND PRESENT IN FOLLOWING FORMAT, ALL LOWERCASE :-
+    ||QuestionId|Answer|Type||
+
+    ANSWER (ONLY the extracted value or special keyword):
+2025-05-15 19:49:03.699 [128600786782016] : -----------------------------------------------------------------
+2025-05-15 19:49:04.537 [128600786782016] : T2T GPT returned : ||age|100|number||
+2025-05-15 19:49:04.537 [128600786782016] : extracted values : age, 100, number
+2025-05-15 19:49:04.537 [128600786782016] : Prepared data : {'age': 100}
+2025-05-15 19:49:04.537 [128600786782016] : extracted1 : {'age': 100}
+
+
+=========================================================================================================================
