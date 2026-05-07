@@ -2,7 +2,7 @@ import React, {
   useState, useEffect, useRef, useCallback,
 } from 'react';
 import {
-  Phone, PhoneOff, Mic, MicOff, Clock, TrendingUp,
+  Phone, PhoneOff, Clock, TrendingUp,
   X, RefreshCw, CheckCircle, AlertCircle, User,
 } from 'lucide-react';
 
@@ -68,13 +68,16 @@ const OBJ_LABEL: Record<string, string> = {
 };
 
 const DEMO_LEADS: Lead[] = [
-  { id: 'lead_001', name: 'Rajesh Kumar',  phone: '9876543210', language: 'hi', gender: 'male',   status: 'pending', city: 'Delhi',     profession: 'Financial Advisor' },
-  { id: 'lead_002', name: 'Priya Sharma',  phone: '9123456780', language: 'hi', gender: 'female', status: 'pending', city: 'Mumbai',    profession: 'Mutual Fund Distributor' },
-  { id: 'lead_003', name: 'Ankit Mehta',   phone: '9988776655', language: 'en', gender: 'male',   status: 'pending', city: 'Bangalore', profession: 'Insurance Agent' },
-  { id: 'lead_004', name: 'Sunita Reddy',  phone: '8877665544', language: 'hi', gender: 'female', status: 'pending', city: 'Hyderabad', profession: 'Finance Influencer' },
-  { id: 'lead_005', name: 'Vikram Patel',  phone: '7766554433', language: 'hi', gender: 'male',   status: 'pending', city: 'Ahmedabad', profession: 'Sub-Broker' },
-  { id: 'lead_006', name: 'Meena Joshi',   phone: '9955112233', language: 'hi', gender: 'female', status: 'pending', city: 'Jaipur',    profession: 'CA / Tax Consultant' },
-  { id: 'lead_007', name: 'Arun Nair',     phone: '9944556677', language: 'en', gender: 'male',   status: 'pending', city: 'Kochi',     profession: 'Stock Sub-Broker' },
+  { id: 'lead_001', name: 'Rajesh Kumar',   phone: '9876543210', language: 'hi', gender: 'male',   status: 'pending', city: 'Delhi',     profession: 'Financial Advisor' },
+  { id: 'lead_002', name: 'Priya Sharma',   phone: '9123456780', language: 'hi', gender: 'female', status: 'pending', city: 'Mumbai',    profession: 'Mutual Fund Distributor' },
+  { id: 'lead_003', name: 'Ankit Mehta',    phone: '9988776655', language: 'en', gender: 'male',   status: 'pending', city: 'Bangalore', profession: 'Insurance Agent' },
+  { id: 'lead_004', name: 'Sunita Reddy',   phone: '8877665544', language: 'te', gender: 'female', status: 'pending', city: 'Hyderabad', profession: 'Finance Influencer' },
+  { id: 'lead_005', name: 'Vikram Patel',   phone: '7766554433', language: 'gu', gender: 'male',   status: 'pending', city: 'Ahmedabad', profession: 'Sub-Broker' },
+  { id: 'lead_006', name: 'Meena Joshi',    phone: '9955112233', language: 'mr', gender: 'female', status: 'pending', city: 'Pune',      profession: 'CA / Tax Consultant' },
+  { id: 'lead_007', name: 'Arun Nair',      phone: '9944556677', language: 'en', gender: 'male',   status: 'pending', city: 'Kochi',     profession: 'Stock Sub-Broker' },
+  { id: 'lead_008', name: 'Karthik Iyer',   phone: '9871234560', language: 'ta', gender: 'male',   status: 'pending', city: 'Chennai',   profession: 'Financial Advisor' },
+  { id: 'lead_009', name: 'Sneha Banerjee', phone: '8899776655', language: 'bn', gender: 'female', status: 'pending', city: 'Kolkata',   profession: 'Mutual Fund Distributor' },
+  { id: 'lead_010', name: 'Rahul Verma',    phone: '9988123456', language: 'hi', gender: 'male',   status: 'pending', city: 'Lucknow',   profession: 'Financial Advisor' },
 ];
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -245,41 +248,157 @@ export default function App() {
     setIsRecording(false);
   }, []);
 
-  // ── Toggle mic ────────────────────────────────────────────────────────────
-  const toggleMic = useCallback(async () => {
-    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+  // ── Continuous mic stream with sliding-window VAD + pre/post buffer ─────
+  // The mic is opened once when the call connects and stays open until End
+  // Call. Every frame is fed into a rolling pre-buffer; when VAD flips on,
+  // the pre-buffer is flushed first (so Whisper hears the soft onset of the
+  // utterance), then voiced frames stream live. After SILENCE_FRAMES_THRESHOLD
+  // of trailing silence, a post-buffer of POST_MS is collected and sent,
+  // followed by an ASCII "DONE" sentinel — same wire protocol the BE expects.
+  // Frames are dropped while the bot is speaking so its TTS doesn't echo back.
+  const startMicStream = useCallback(async () => {
+    // Audio framing
+    const PRE_MS                  = 1784;      // 892 * 2 — pre-voice context for Whisper
+    const POST_MS                 = 892;       // trailing silence captured after VAD off
+    const FRAME_MS                = 30;
+    const FRAME_SAMPLES           = 16000 * FRAME_MS / 1000;        // 480
+    const PRE_SAMPLES             = Math.ceil(PRE_MS  / FRAME_MS) * FRAME_SAMPLES;
+    const POST_SAMPLES            = Math.ceil(POST_MS / FRAME_MS) * FRAME_SAMPLES;
+    const VAD_WINDOW_SAMPLES      = 6144;      // ~384 ms rolling VAD window
+    const SILENCE_FRAMES_THRESHOLD = 8;        // ≈8 * 256 ms script-processor frames of silence ends utterance
 
-    if (isRecording) {
-      stopRecording();
-      wsRef.current.send(DONE_BYTES.buffer.slice(0));
-      setIsProcessing(true);
-    } else {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        streamRef.current = stream;
+    // VAD energy thresholds
+    const AUDIO_SPEAKER_THRESHOLD = 0.1;       // for interrupt detection while bot is talking
+    const MAX_NOISE_SAMPLES       = 25;
+    const NOISE_HISTORY_LENGTH    = 10;
 
-        const ctx = new AudioContext({ sampleRate: 16000 });
-        recCtxRef.current = ctx;
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = stream;
 
-        const src  = ctx.createMediaStreamSource(stream);
-        const proc = ctx.createScriptProcessor(4096, 1, 1);
-        sourceRef.current    = src;
-        processorRef.current = proc;
+      const ctx  = new AudioContext({ sampleRate: 16000 });
+      recCtxRef.current = ctx;
+      const src  = ctx.createMediaStreamSource(stream);
+      const proc = ctx.createScriptProcessor(4096, 1, 1);
+      sourceRef.current    = src;
+      processorRef.current = proc;
 
-        proc.onaudioprocess = (e) => {
-          if (wsRef.current?.readyState !== WebSocket.OPEN) return;
-          const pcm = float32ToInt16(e.inputBuffer.getChannelData(0));
-          wsRef.current.send(pcm.buffer.slice(0));
-        };
+      // Per-call VAD + buffer state (closure)
+      const noiseSamples: number[] = [];
+      const noiseHistory: number[] = [];
+      let   avgNoise            = 0;
+      let   userSpeakerThreshold = 0.03;
+      let   preBuffer:  number[] = [];
+      let   postBuffer: number[] = [];
+      let   postSamplesCnt   = 0;
+      let   isVoiceActive    = false;
+      let   silenceFrameCount = 0;
+      let   vadWindow:  number[] = [];
 
-        src.connect(proc);
-        proc.connect(ctx.destination);
-        setIsRecording(true);
-      } catch {
-        alert('Microphone access denied — please allow mic access and try again.');
-      }
+      const computeZCR = (a: number[]): number => {
+        let zc = 0;
+        for (let i = 1; i < a.length; i++) {
+          if ((a[i-1] >= 0 && a[i] < 0) || (a[i-1] < 0 && a[i] >= 0)) zc++;
+        }
+        return zc / a.length;
+      };
+
+      const detectVoiceActivity = (a: number[]): boolean => {
+        if (!a || a.length === 0) return false;
+        let sumSq = 0;
+        for (let i = 0; i < a.length; i++) sumSq += a[i] * a[i];
+        const avg = Math.sqrt(sumSq / a.length);
+
+        // Adaptive noise floor — only sample when bot isn't playing
+        if (!speakingRef.current && avg < 0.055) {
+          noiseSamples.push(avg);
+          if (noiseSamples.length > MAX_NOISE_SAMPLES) noiseSamples.shift();
+          const mean = noiseSamples.reduce((s, x) => s + x, 0) / noiseSamples.length;
+          if (mean > 0) avgNoise = mean;
+          userSpeakerThreshold = Math.max(avgNoise + 0.02, 0.03);
+        }
+
+        noiseHistory.push(avgNoise);
+        if (noiseHistory.length > NOISE_HISTORY_LENGTH) noiseHistory.shift();
+
+        const threshold       = speakingRef.current ? AUDIO_SPEAKER_THRESHOLD : userSpeakerThreshold;
+        const zcr             = computeZCR(a);
+        const noiseHistorySum = noiseHistory.reduce((s, x) => s + x, 0);
+
+        if (speakingRef.current) {
+          // While bot speaks: stricter ZCR floor to suppress false-interrupts from speaker echo
+          return avg > threshold && zcr > 0.03;
+        }
+        // Normal case: avoid high-freq noise (zcr cap) and require some noise history
+        return avg > threshold && zcr < 0.14 && noiseHistorySum !== 0;
+      };
+
+      proc.onaudioprocess = (e) => {
+        const ws = wsRef.current;
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+        const frameF32 = e.inputBuffer.getChannelData(0);
+        const frame    = Array.from(frameF32);
+
+        // Always maintain rolling pre-buffer — captures audio BEFORE VAD fires
+        preBuffer.push(...frame);
+        if (preBuffer.length > PRE_SAMPLES) preBuffer.splice(0, preBuffer.length - PRE_SAMPLES);
+
+        // Don't decide / send while bot is talking through the speakers
+        if (speakingRef.current) return;
+
+        // Keep VAD window fresh
+        vadWindow.push(...frame);
+        if (vadWindow.length > VAD_WINDOW_SAMPLES) vadWindow.splice(0, vadWindow.length - VAD_WINDOW_SAMPLES);
+
+        const voiced = detectVoiceActivity(vadWindow);
+
+        if ((voiced && silenceFrameCount < SILENCE_FRAMES_THRESHOLD) ||
+            (silenceFrameCount < SILENCE_FRAMES_THRESHOLD && isVoiceActive)) {
+          // Active utterance — voice or short silence dip mid-utterance
+          if (!voiced && isVoiceActive) silenceFrameCount++;
+          if (voiced) silenceFrameCount = 0;
+
+          if (!isVoiceActive) {
+            // First detection: flush pre-buffer
+            isVoiceActive = true;
+            const pcm = float32ToInt16(new Float32Array(preBuffer));
+            ws.send(pcm.buffer.slice(0) as ArrayBuffer);
+          } else {
+            // Streaming a voiced (or briefly silent) frame
+            const pcm = float32ToInt16(frameF32);
+            ws.send(pcm.buffer.slice(0) as ArrayBuffer);
+          }
+          preBuffer.length  = 0;
+          postBuffer.length = 0;
+          postSamplesCnt    = 0;
+        } else if (isVoiceActive && silenceFrameCount === SILENCE_FRAMES_THRESHOLD) {
+          // Silence threshold just hit — collect the post-buffer tail
+          postBuffer.push(...frame);
+          postSamplesCnt += frame.length;
+
+          if (postSamplesCnt >= POST_SAMPLES) {
+            // Flush post-buffer + DONE in that order
+            const pcm = float32ToInt16(new Float32Array(postBuffer));
+            ws.send(pcm.buffer.slice(0) as ArrayBuffer);
+            ws.send(DONE_BYTES.buffer.slice(0) as ArrayBuffer);
+
+            isVoiceActive    = false;
+            postBuffer.length = 0;
+            postSamplesCnt   = 0;
+            silenceFrameCount = 0;
+            setIsProcessing(true);
+          }
+        }
+      };
+
+      src.connect(proc);
+      proc.connect(ctx.destination);
+      setIsRecording(true);
+    } catch {
+      alert('Microphone access denied — please allow mic access and try again.');
     }
-  }, [isRecording, stopRecording]);
+  }, []);
 
   // ── Start call ────────────────────────────────────────────────────────────
   const startCall = useCallback((lead: Lead) => {
@@ -325,6 +444,10 @@ export default function App() {
     ws.onopen = () => {
       setIsConnected(true);
       ws.send(`SESSION_ID:${sessionId}:${lead.id}`);
+      // Open the mic right away. While the bot's intro plays, VAD inside
+      // startMicStream gates on speakingRef so no frames are sent — the
+      // moment the bot stops speaking, VAD takes over and listens.
+      startMicStream();
     };
 
     ws.onmessage = async (ev) => {
@@ -369,7 +492,7 @@ export default function App() {
 
     ws.onclose  = () => setIsConnected(false);
     ws.onerror  = () => setWsError('WebSocket error — is the bot server running on port 8579?');
-  }, [finaliseCall, playAudio]);
+  }, [finaliseCall, playAudio, startMicStream]);
 
   // ── Hang up ───────────────────────────────────────────────────────────────
   const hangUp = useCallback(() => {
@@ -650,27 +773,13 @@ export default function App() {
                   </span>
                 )}
                 {isConnected && !isBotSpeaking && !isProcessing && !isRecording && !callEnded && (
-                  <span className="text-slate-400">Click the mic to speak</span>
+                  <span className="text-slate-400">Listening — speak naturally</span>
                 )}
                 {callEnded && <span className="text-slate-400">Call ended</span>}
               </div>
 
-              {/* Mic + Hang up */}
+              {/* End Call is the only control — mic streams hands-free via VAD */}
               <div className="flex items-center gap-3 shrink-0">
-                {!callEnded && (
-                  <button
-                    onClick={toggleMic}
-                    disabled={!isConnected || isBotSpeaking}
-                    title={isRecording ? 'Click to stop & send' : 'Click to speak'}
-                    className={`w-12 h-12 rounded-full flex items-center justify-center transition shadow-sm disabled:opacity-40 disabled:cursor-not-allowed ${
-                      isRecording
-                        ? 'bg-red-50 text-red-600 ring-2 ring-red-400 ring-offset-2 hover:bg-red-100'
-                        : 'bg-teal-600 text-white hover:bg-teal-700'
-                    }`}
-                  >
-                    {isRecording ? <MicOff size={19} /> : <Mic size={19} />}
-                  </button>
-                )}
                 <button
                   onClick={closeModal}
                   className="flex items-center gap-1.5 px-4 py-2 bg-red-500 text-white text-sm font-semibold rounded-xl hover:bg-red-600 transition shadow-sm"

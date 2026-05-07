@@ -1204,13 +1204,16 @@ SESSION_CONVERSATION: dict[str, list[dict]] = {}
 
 # ── LEADS DATABASE (demo leads for RM dashboard) ─────────────────────────────
 LEADS_DB: list[dict] = [
-    {"id": "lead_001", "name": "Rajesh Kumar",  "phone": "9876543210", "language": "hi", "gender": "male",   "status": "pending", "city": "Delhi",      "profession": "Financial Advisor",        "summary": None},
-    {"id": "lead_002", "name": "Priya Sharma",  "phone": "9123456780", "language": "hi", "gender": "female", "status": "pending", "city": "Mumbai",     "profession": "Mutual Fund Distributor",  "summary": None},
-    {"id": "lead_003", "name": "Ankit Mehta",   "phone": "9988776655", "language": "en", "gender": "male",   "status": "pending", "city": "Bangalore",  "profession": "Insurance Agent",          "summary": None},
-    {"id": "lead_004", "name": "Sunita Reddy",  "phone": "8877665544", "language": "hi", "gender": "female", "status": "pending", "city": "Hyderabad",  "profession": "Finance Influencer",       "summary": None},
-    {"id": "lead_005", "name": "Vikram Patel",  "phone": "7766554433", "language": "hi", "gender": "male",   "status": "pending", "city": "Ahmedabad",  "profession": "Sub-Broker",               "summary": None},
-    {"id": "lead_006", "name": "Meena Joshi",   "phone": "9955112233", "language": "hi", "gender": "female", "status": "pending", "city": "Jaipur",     "profession": "CA / Tax Consultant",      "summary": None},
-    {"id": "lead_007", "name": "Arun Nair",     "phone": "9944556677", "language": "en", "gender": "male",   "status": "pending", "city": "Kochi",      "profession": "Stock Sub-Broker",         "summary": None},
+    {"id": "lead_001", "name": "Rajesh Kumar",      "phone": "9876543210", "language": "hi", "gender": "male",   "status": "pending", "city": "Delhi",     "profession": "Financial Advisor",        "summary": None},
+    {"id": "lead_002", "name": "Priya Sharma",      "phone": "9123456780", "language": "hi", "gender": "female", "status": "pending", "city": "Mumbai",    "profession": "Mutual Fund Distributor",  "summary": None},
+    {"id": "lead_003", "name": "Ankit Mehta",       "phone": "9988776655", "language": "en", "gender": "male",   "status": "pending", "city": "Bangalore", "profession": "Insurance Agent",          "summary": None},
+    {"id": "lead_004", "name": "Sunita Reddy",      "phone": "8877665544", "language": "te", "gender": "female", "status": "pending", "city": "Hyderabad", "profession": "Finance Influencer",       "summary": None},
+    {"id": "lead_005", "name": "Vikram Patel",      "phone": "7766554433", "language": "gu", "gender": "male",   "status": "pending", "city": "Ahmedabad", "profession": "Sub-Broker",               "summary": None},
+    {"id": "lead_006", "name": "Meena Joshi",       "phone": "9955112233", "language": "mr", "gender": "female", "status": "pending", "city": "Pune",      "profession": "CA / Tax Consultant",      "summary": None},
+    {"id": "lead_007", "name": "Arun Nair",         "phone": "9944556677", "language": "en", "gender": "male",   "status": "pending", "city": "Kochi",     "profession": "Stock Sub-Broker",         "summary": None},
+    {"id": "lead_008", "name": "Karthik Iyer",      "phone": "9871234560", "language": "ta", "gender": "male",   "status": "pending", "city": "Chennai",   "profession": "Financial Advisor",        "summary": None},
+    {"id": "lead_009", "name": "Sneha Banerjee",    "phone": "8899776655", "language": "bn", "gender": "female", "status": "pending", "city": "Kolkata",   "profession": "Mutual Fund Distributor",  "summary": None},
+    {"id": "lead_010", "name": "Rahul Verma",       "phone": "9988123456", "language": "hi", "gender": "male",   "status": "pending", "city": "Lucknow",   "profession": "Financial Advisor",        "summary": None},
 ]
 SESSION_TO_LEAD: dict[str, str] = {}   # sessionId → leadId
 ###########################
