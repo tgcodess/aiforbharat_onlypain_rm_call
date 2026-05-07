@@ -1,0 +1,46 @@
+{
+  "obj_already_broker": {
+    "patterns": [
+      "already working with another broker",
+      "already have broker",
+      "already tied up"
+    ],
+    "response": "That’s great sir — then you already understand this business well. My question is: are you getting 100% brokerage sharing and daily payouts there as well?"
+  },
+
+  "obj_no_contacts": {
+    "patterns": [
+      "don't have enough contacts",
+      "small network",
+      "not enough clients"
+    ],
+    "response": "Many partners actually begin with their existing network itself — current clients, friends, family, and local references."
+  },
+
+  "obj_support": {
+    "patterns": [
+      "who handles support",
+      "what if clients face issues",
+      "client problem"
+    ],
+    "response": "Don’t worry sir, Rupeezy provides backend operational support and dedicated RM assistance."
+  },
+
+  "obj_trust": {
+    "patterns": [
+      "is rupeezy trustworthy",
+      "is this genuine",
+      "can i trust rupeezy"
+    ],
+    "response": "Rupeezy has over 20 years of market presence and provides complete transparency through its systems and partner portal."
+  },
+
+  "obj_think_later": {
+    "patterns": [
+      "i'll think about it",
+      "call me later",
+      "not now"
+    ],
+    "response": "Absolutely sir, no problem at all. I’ll share the details and signup link on WhatsApp so you can review comfortably."
+  }
+}

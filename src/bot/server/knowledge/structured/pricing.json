@@ -1,0 +1,14 @@
+{
+  "plans": [
+    {
+      "clients": "1-50",
+      "monthly_fee": "2499"
+    },
+    {
+      "clients": "51-200",
+      "monthly_fee": "4999"
+    }
+  ],
+
+  "note": "Subscription fee can be deducted from commissions earned."
+}

@@ -1,0 +1,16 @@
+{
+  "weights": {
+    "intent": 30,
+    "readiness": 25,
+    "fit_network": 20,
+    "engagement": 10,
+    "objection_resolution": 10,
+    "sentiment": 5
+  },
+
+  "thresholds": {
+    "HOT": 75,
+    "WARM": 45,
+    "COLD": 0
+  }
+}

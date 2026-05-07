@@ -1,0 +1,19 @@
+{
+  "steps": [
+    "Apply online",
+    "Upload documents",
+    "Verification",
+    "Receive RISE Portal access",
+    "Start onboarding clients"
+  ],
+
+  "documents": [
+    "PAN",
+    "Aadhaar",
+    "Bank Details",
+    "Address Proof",
+    "Photograph"
+  ],
+
+  "timeline": "Typically within 24 hours"
+}

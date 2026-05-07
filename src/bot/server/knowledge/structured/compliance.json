@@ -1,0 +1,13 @@
+{
+  "restricted_claims": [
+    "guaranteed income",
+    "risk-free earnings",
+    "fixed returns"
+  ],
+
+  "rules": [
+    "Do not provide financial advice",
+    "Do not exaggerate earnings",
+    "Escalate legal queries to RM"
+  ]
+}

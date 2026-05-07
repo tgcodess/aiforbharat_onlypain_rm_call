@@ -1,0 +1,13 @@
+{
+  "stages": [
+    "INTRO",
+    "DISCOVERY",
+    "PITCH",
+    "BENEFIT_EXPLANATION",
+    "OBJECTION_HANDLING",
+    "QUALIFICATION",
+    "CTA",
+    "HANDOFF",
+    "END"
+  ]
+}

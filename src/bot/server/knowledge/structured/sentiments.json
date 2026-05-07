@@ -1,0 +1,23 @@
+{
+  "positive": {
+    "signals": [
+      "asks questions",
+      "curious tone",
+      "engaged"
+    ]
+  },
+
+  "hesitant": {
+    "signals": [
+      "uncertain replies",
+      "asks for time"
+    ]
+  },
+
+  "frustrated": {
+    "signals": [
+      "interruptions",
+      "negative responses"
+    ]
+  }
+}

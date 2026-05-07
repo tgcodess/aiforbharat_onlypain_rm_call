@@ -129,7 +129,6 @@ export default function App() {
   const [isRecording, setIsRecording]   = useState(false);
   const [isBotSpeaking, setIsBotSpeaking] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
-  const [introPlaying, setIntroPlaying] = useState(false);
   const [transcript, setTranscript]     = useState<TxEntry[]>([]);
   const [callSummary, setCallSummary]   = useState<CallSummary | null>(null);
   const [callEnded, setCallEnded]       = useState(false);
@@ -203,7 +202,6 @@ export default function App() {
         // Only clear speaking flag when the whole queue has drained
         if (nextPlayRef.current <= (playCtxRef.current?.currentTime ?? 0) + 0.15) {
           setIsBotSpeaking(false);
-          setIntroPlaying(false);
         }
       };
     } catch (e) {
@@ -295,7 +293,6 @@ export default function App() {
     setIsRecording(false);
     setIsBotSpeaking(false);
     setIsProcessing(false);
-    setIntroPlaying(true);
     setWsError(null);
     nextPlayRef.current = 0;
 
@@ -391,7 +388,6 @@ export default function App() {
       setCallSummary(null);
       setTranscript([]);
       setDuration('0:00');
-      setIntroPlaying(false);
     }, 100);
   }, [hangUp]);
 
@@ -555,11 +551,8 @@ export default function App() {
             <div className="flex-1 overflow-y-auto px-5 py-4 space-y-2.5 min-h-[220px]">
               {transcript.length === 0 && (
                 <div className="flex flex-col items-center justify-center h-full py-10 text-slate-400">
-                  {introPlaying ? (
-                    <>
-                      <WaveAnim color="teal" />
-                      <p className="mt-2 text-xs">Priya is delivering the opening pitch…</p>
-                    </>
+                  {isBotSpeaking ? (
+                    <WaveAnim color="teal" />
                   ) : isConnected ? (
                     <p className="text-xs">Press the mic to start speaking</p>
                   ) : (
@@ -656,7 +649,7 @@ export default function App() {
                     Recording — click mic to send
                   </span>
                 )}
-                {isConnected && !isBotSpeaking && !isProcessing && !isRecording && !callEnded && !introPlaying && (
+                {isConnected && !isBotSpeaking && !isProcessing && !isRecording && !callEnded && (
                   <span className="text-slate-400">Click the mic to speak</span>
                 )}
                 {callEnded && <span className="text-slate-400">Call ended</span>}
@@ -667,7 +660,7 @@ export default function App() {
                 {!callEnded && (
                   <button
                     onClick={toggleMic}
-                    disabled={!isConnected || isBotSpeaking || introPlaying}
+                    disabled={!isConnected || isBotSpeaking}
                     title={isRecording ? 'Click to stop & send' : 'Click to speak'}
                     className={`w-12 h-12 rounded-full flex items-center justify-center transition shadow-sm disabled:opacity-40 disabled:cursor-not-allowed ${
                       isRecording

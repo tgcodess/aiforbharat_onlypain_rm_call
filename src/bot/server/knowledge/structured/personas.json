@@ -1,0 +1,51 @@
+{
+  "MFD": {
+    "focus": [
+      "cross-selling",
+      "investor network",
+      "additional revenue"
+    ],
+    "pitch": "You already advise clients on investments. Rupeezy helps you monetize their trading activity as well."
+  },
+
+  "Financial Advisor": {
+    "focus": [
+      "wealth clients",
+      "additional brokerage income"
+    ],
+    "pitch": "You can generate additional revenue from your existing investor base."
+  },
+
+  "Insurance Agent": {
+    "focus": [
+      "trusted client relationships",
+      "recurring income"
+    ],
+    "pitch": "You already have trusted client relationships. This creates an additional recurring income stream alongside insurance."
+  },
+
+  "Finance Influencer": {
+    "focus": [
+      "audience monetization",
+      "referrals",
+      "scalable revenue"
+    ],
+    "pitch": "You can monetize your finance audience through brokerage partnerships and referrals."
+  },
+
+  "Sub Broker": {
+    "focus": [
+      "higher brokerage sharing",
+      "daily payouts"
+    ],
+    "pitch": "Most brokers provide 60–70% sharing with monthly payouts. Rupeezy offers 100% brokerage sharing with daily payouts."
+  },
+
+  "CA": {
+    "focus": [
+      "service expansion",
+      "investment ecosystem"
+    ],
+    "pitch": "You can expand into investment and trading services for your existing clients."
+  }
+}

@@ -1,0 +1,33 @@
+[
+  {
+    "type": "hot_lead",
+    "conversation": [
+      {
+        "speaker": "Priya",
+        "text": "Hi sir, Priya this side from Rupeezy."
+      },
+      {
+        "speaker": "Lead",
+        "text": "Tell me more."
+      },
+      {
+        "speaker": "Priya",
+        "text": "You currently work as a financial advisor, right sir?"
+      }
+    ]
+  },
+
+  {
+    "type": "objection",
+    "conversation": [
+      {
+        "speaker": "Lead",
+        "text": "I already work with another broker."
+      },
+      {
+        "speaker": "Priya",
+        "text": "That’s great sir — then you already understand this business well."
+      }
+    ]
+  }
+]

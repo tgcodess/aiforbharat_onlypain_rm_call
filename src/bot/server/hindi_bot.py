@@ -12,16 +12,23 @@ Highlights :-
 
 
 """
-App Setup Description followed by Commands :-
+App Setup Description followed by Commands for 
+BACKEND :-
 1) Download Anaconda : wget https://repo.anaconda.com/archive/Anaconda3-2024.10-1-Linux-x86_64.sh
 2) Run the binary to set it up : sh Anaconda3-2024.10-1-Linux-x86_64.sh
 3) Load conda in the terminal env : source ~/.bashrc
 4) Create conda environment with python 3.12 : conda create --name myenv python=3.12
 5) Activate conda environment : conda activate myenv
-6) Install required packages : pip install torch indic-num2words torchaudio rapidfuzz asyncio websockets webrtcvad torch wave numpy transformers noisereduce soundfile openai chromadb sentence-transformers elevenlabs
+6) Install required packages : pip install torch indic-num2words torchaudio rapidfuzz websockets webrtcvad torch wave numpy transformers noisereduce soundfile openai chromadb sentence-transformers elevenlabs pymysql groq omnivoice
 7) Mention the Port under "Websocket Configuration"
 8) Run the file : python hindi_bot.py
 9) Service is ready to connect from the client via WebSockets
+
+Frontend :-
+1) Run npm install in the frontend directory to install dependencies
+2) Run the React app : npm run dev
+3) Make sure the connection link in the frontend matches the HOST and PORT mentioned in the backend config.
+
 """
 
 
@@ -93,6 +100,45 @@ intent_collection = chroma_client.create_collection(name="intent_collection")
 
 
 sentenceTransformerModel = SentenceTransformer("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+
+###########################
+# KNOWLEDGE BASE LOADER — single source of truth lives in knowledge/
+# Hardcoded fallbacks below are used only if a file is missing or malformed,
+# so the bot still boots cleanly in degraded environments.
+KNOWLEDGE_DIR  = os.path.join(os.path.dirname(__file__), "knowledge")
+STRUCTURED_DIR = os.path.join(KNOWLEDGE_DIR, "structured")
+
+def _load_json(name: str, default):
+    path = os.path.join(STRUCTURED_DIR, f"{name}.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        print(f"[KB] Could not load {name}.json — using fallback ({e})")
+        return default
+
+def _load_text(name: str, default: str = "") -> str:
+    path = os.path.join(KNOWLEDGE_DIR, name)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except FileNotFoundError as e:
+        print(f"[KB] Could not load {name} — using fallback ({e})")
+        return default
+
+KB_FAQ          = _load_json("faq",                 [])
+KB_OBJECTIONS   = _load_json("objections",          {})
+KB_PERSONAS     = _load_json("personas",            {})
+KB_PRICING      = _load_json("pricing",             {"plans": [], "note": ""})
+KB_PRODUCTS     = _load_json("products",            [])
+KB_ONBOARDING   = _load_json("onboarding",          {"steps": [], "documents": [], "timeline": ""})
+KB_REGULATIONS  = _load_json("regulations",         {})
+KB_COMPLIANCE   = _load_json("compliance",          {"restricted_claims": [], "rules": []})
+KB_SCRIPTS      = _load_json("scripts",             {})
+KB_QUAL         = _load_json("qualification",       {"weights": {}, "thresholds": {}})
+KB_WHATSAPP     = _load_json("whatsapp_templates",  {})
+KB_SYSTEM_PROMPT = _load_text("system_prompt.txt",  "")
+###########################
 intent_dataset = [
     # --- INTERESTED / AP PARTNERSHIP (Rupeezy - Hindi + English) ---
     ("Haan, sunao", "interested"),
@@ -703,10 +749,14 @@ intent_dataset = [
 # Add documents to the Chroma collection
 intent_collection.add(
     documents=[txt for txt, intent in intent_dataset],
-    embeddings=[sentenceTransformerModel.encode(txt, normalize_embeddings=True).tolist() for txt, intent in intent_dataset],  # Ensure list type if required
+    embeddings=[sentenceTransformerModel.encode(txt, normalize_embeddings=True).tolist() for txt, intent in intent_dataset],
     metadatas=[{"intent": intent} for txt, intent in intent_dataset],
     ids=[f"intent_{i}" for i in range(len(intent_dataset))]
 )
+
+# ── Rupeezy AP knowledge base — built lazily after KB_DOCUMENTS is defined ──
+# Populated in _build_kb_collection() called at boot after all constants are ready
+kb_collection = None
 
 # Function to detect intent from user text input
 def detect_intent_with_chroma(text: str) -> str:
@@ -853,6 +903,148 @@ def qprompt(q: dict, lang: str) -> str:
     """Return the question prompt in the session language, falling back to Hindi."""
     return QUESTIONNAIRE_LANG.get(lang, QUESTIONNAIRE_LANG["hi"]).get(q["id"], q["prompt"])
 
+# ── CALL STAGE MACHINE ────────────────────────────────────────────────────────
+CALL_STAGES = ["INTRO", "DISCOVERY", "PITCH", "OBJECTION_HANDLING", "QUALIFICATION", "CTA", "HANDOFF", "END"]
+
+STAGE_INSTRUCTIONS: dict[str, str] = {
+    "INTRO":              "You've just introduced yourself. Build rapport and confirm language. Keep it brief and warm.",
+    "DISCOVERY":          "Ask ONE open-ended question about their current work and client base. Do NOT pitch yet. Listen and mirror.",
+    "PITCH":              "Deliver a sharp, persona-tailored pitch for Rupeezy's AP program. Use real numbers. No bullet points. One key benefit per turn.",
+    "OBJECTION_HANDLING": "Address the objection naturally. Validate first, then reframe. Redirect toward value without being pushy.",
+    "QUALIFICATION":      "Collect missing lead details conversationally — don't sound like a form. Weave questions naturally.",
+    "CTA":                "Drive toward one action: WhatsApp signup link or confirm callback time. Joining is free — risk is zero. Be direct but warm.",
+    "HANDOFF":            "Wrap up warmly. Tell them a dedicated Rupeezy RM will reach out within 24 hours. Leave them excited.",
+    "END":                "Close politely. Leave the door open. Thank them for their time.",
+}
+
+# Maps the persona names used by the dashboard/UI to keys in personas.json.
+# The bot's lead.profession field uses the verbose UI names; the knowledge base
+# uses short keys. This map keeps both in sync without duplicating content.
+PERSONA_KEY_MAP: dict[str, str] = {
+    "Mutual Fund Distributor": "MFD",
+    "Financial Advisor":       "Financial Advisor",
+    "Insurance Agent":         "Insurance Agent",
+    "Finance Influencer":      "Finance Influencer",
+    "Sub-Broker":              "Sub Broker",
+    "Stock Sub-Broker":        "Sub Broker",
+    "CA / Tax Consultant":     "CA",
+}
+
+def _build_persona_pitch() -> dict[str, str]:
+    out: dict[str, str] = {}
+    for ui_name, kb_key in PERSONA_KEY_MAP.items():
+        persona = KB_PERSONAS.get(kb_key, {})
+        pitch = persona.get("pitch", "").strip()
+        focus = ", ".join(persona.get("focus", []))
+        if pitch:
+            out[ui_name] = f"{pitch} Focus: {focus}." if focus else pitch
+    reg = KB_REGULATIONS
+    out["default"] = (
+        "Zero joining fee, 100% brokerage sharing, daily payouts via RISE partner portal. "
+        f"Operated by {reg.get('company', 'Astha Credit & Securities Pvt. Ltd.')} — "
+        f"SEBI registered ({reg.get('sebi_registration', '')}), "
+        f"{reg.get('years_in_market', '20+')} years of market presence."
+    )
+    return out
+
+PERSONA_PITCH: dict[str, str] = _build_persona_pitch()
+
+SENTIMENT_KEYWORDS: dict[str, list[str]] = {
+    "high_intent":  ["join", "signup", "karna chahta", "karna chahti", "ready", "bhej do", "link do", "register", "abhi", "kal tak", "haan zaroor", "bilkul"],
+    "positive":     ["haan", "yes", "achha", "good", "okay", "ok", "theek hai", "batao", "sunao", "sounds good", "interesting", "accha laga"],
+    "hesitant":     ["sochna", "think", "time chahiye", "baad mein", "later", "maybe", "dekh lete", "pata nahi", "soch ke batata", "soch ke batati"],
+    "confused":     ["samjha nahi", "kya matlab", "repeat", "dobara", "phirse", "clear nahi", "explain", "bata dena"],
+    "frustrated":   ["nahi chahiye", "band karo", "mat karo", "enough", "bye", "chhod do", "no thanks", "not interested", "nahi karna"],
+}
+
+# Assembled at boot from the knowledge JSONs so RAG retrieval always reflects
+# the source of truth in knowledge/structured/.
+def _build_kb_documents() -> list[tuple[str, str]]:
+    docs: list[tuple[str, str]] = []
+
+    # FAQ
+    for i, faq in enumerate(KB_FAQ):
+        q, a = faq.get("question", ""), faq.get("answer", "")
+        if q and a:
+            tag = "_".join(faq.get("tags", [])) or f"faq_{i}"
+            docs.append((f"Q: {q} A: {a}", f"faq_{tag}"))
+
+    # Objection responses (compliance-approved language)
+    for obj_id, data in KB_OBJECTIONS.items():
+        resp = data.get("response", "")
+        if resp:
+            docs.append((resp, obj_id))
+
+    # Persona pitches (from JSON, not hardcoded)
+    for kb_key, data in KB_PERSONAS.items():
+        pitch = data.get("pitch", "")
+        if pitch:
+            slug = kb_key.lower().replace(" ", "_")
+            docs.append((pitch, f"persona_{slug}"))
+
+    # Regulations — actual entity, registration numbers, years
+    reg = KB_REGULATIONS
+    if reg:
+        docs.append((
+            f"Rupeezy AP partnership operates under {reg.get('company', '')} — "
+            f"SEBI registered ({reg.get('sebi_registration', '')}), "
+            f"NSE member ({reg.get('nse_membership', '')}), "
+            f"BSE member ({reg.get('bse_membership', '')}), "
+            f"MCX member ({reg.get('mcx_membership', '')}). "
+            f"{reg.get('years_in_market', '')} years of market presence.",
+            "regulations",
+        ))
+
+    # Onboarding steps + documents + timeline
+    onb = KB_ONBOARDING
+    if onb.get("steps"):
+        docs.append((
+            f"Onboarding flow: {' → '.join(onb.get('steps', []))}. "
+            f"Documents needed: {', '.join(onb.get('documents', []))}. "
+            f"Timeline: {onb.get('timeline', '')}.",
+            "onboarding",
+        ))
+
+    # Pricing plans (subscription model — previously absent from RAG)
+    for plan in KB_PRICING.get("plans", []):
+        docs.append((
+            f"Subscription plan: {plan.get('clients', '')} clients for ₹{plan.get('monthly_fee', '')}/month. "
+            f"{KB_PRICING.get('note', '')}",
+            f"pricing_{plan.get('clients', 'plan').replace('-', '_').replace(' ', '')}",
+        ))
+
+    # Products + charges
+    for prod in KB_PRODUCTS:
+        name = prod.get("product", "")
+        if name:
+            docs.append((
+                f"{name}: {prod.get('charges', '')}. {prod.get('benefit', '')}",
+                f"product_{name.lower().replace(' ', '_')}",
+            ))
+
+    # Compliance reminder (so the LLM sees the restricted-claims list when retrieving)
+    if KB_COMPLIANCE.get("restricted_claims"):
+        docs.append((
+            "Compliance: never use phrases like "
+            f"{', '.join(KB_COMPLIANCE['restricted_claims'])}. "
+            "Avoid quantitative earnings guarantees.",
+            "compliance",
+        ))
+
+    return docs
+
+KB_DOCUMENTS: list[tuple[str, str]] = _build_kb_documents()
+
+DISCOVERY_QUESTIONS: dict[str, str] = {
+    "hi": "Aapka kaam thoda aur samjhna chahti hoon — aap professionally kya karte hain, aur aapke paas kitne clients hain jo financially active hain?",
+    "en": "Tell me a bit about your work — what do you do professionally, and roughly how many clients do you actively work with?",
+    "ta": "Ungal thozhil pattri sollunga — neenga professionally enna panreenga, ungal kita evvalavu clients irukkaanga?",
+    "te": "Meeru professional ga enti chestunnaro cheppandi — Meeru evvaro clients tho financially panichestunnaro?",
+    "mr": "Aapla kaam sangaa — tumi professionally kaay karta, aani tumchyakade kiti clients aahet?",
+    "gu": "Tamara kaam vishe vaat karo — tame professionally shu karo cho ane tamara keta clients chhe?",
+    "bn": "Apnar kaj niye bolen — apni professionally ki koren ebong apnar kache kotojon clients achhe?",
+}
+
 # ── Language metadata ──────────────────────────────────────────────────────────
 LANG_NAMES = {
     "hi": "Hindi", "en": "English", "ta": "Tamil",
@@ -898,61 +1090,6 @@ INTRO_TEXTS = {
     ),
 }
 
-# Language confirmation question — sent immediately after intro
-LANG_CONFIRM_Q = {
-    "hi": (
-        "Aur ek baat — main aapko abhi Hindi mein baat kar rahi hoon. "
-        "Kya yeh theek hai? Ya aap English, Tamil, Telugu, Marathi, Gujarati, "
-        "ya Bengali mein prefer karte hain?"
-    ),
-    "en": (
-        "Also — I'm speaking in English right now. Is that comfortable for you? "
-        "Or would you prefer Hindi, Tamil, Telugu, Marathi, Gujarati, or Bengali?"
-    ),
-    "ta": (
-        "Oru vishayam — naan ippo Tamil-il pesugiren. Ungalukkaga sari thana? "
-        "Illai English, Hindi, Telugu, Marathi, Gujarati, Bengali vidambu?"
-    ),
-    "te": (
-        "Okka vishayam — nenu ipudu Telugu-lo matladutunna. Meeru okay-na? "
-        "Leka English, Hindi, Tamil, Marathi, Gujarati, Bengali prefer chestarara?"
-    ),
-    "mr": (
-        "Ek goshta — mi ata Marathi mein bolte. Tumhala theek ahe na? "
-        "Ki tumhi English, Hindi, Tamil, Telugu, Gujarati, Bengali prefer karnar?"
-    ),
-    "gu": (
-        "Ek vaat — hu ahhi Gujarati ma vaat karu chhu. Tamne thaik chhe? "
-        "Ke tamne English, Hindi, Tamil, Telugu, Marathi, Bengali pasand chhe?"
-    ),
-    "bn": (
-        "Ekta byapar — ami ekhon Bangla-te bolchi. Eta ki apnar subidhajanak? "
-        "Nahole English, Hindi, Tamil, Telugu, Marathi, Gujarati prefer koren?"
-    ),
-}
-
-# Switch acknowledgement after language change
-LANG_SWITCH_ACK = {
-    "hi": "Bilkul! Ab main Hindi mein baat karta hoon.",
-    "en": "Of course! Continuing in English.",
-    "ta": "Sari! Naan Tamil-il thodarvugiren.",
-    "te": "Sari! Nenu Telugu-lo continue chestanu.",
-    "mr": "Theek aahe! Mi Marathi mein pudhey bolto.",
-    "gu": "Saru! Hu Gujarati ma aage vaat karis.",
-    "bn": "Thik achhe! Ami Bangla-te continue korchi.",
-}
-
-# Language confirmation ack (no switch needed)
-LANG_CONFIRM_ACK = {
-    "hi": "Achha! Chaliye aage badhte hain.",
-    "en": "Great! Let's continue.",
-    "ta": "Nandru! Thodaruvom.",
-    "te": "Manchidi! Mundukundam.",
-    "mr": "Chhan! Pudhe jaau.",
-    "gu": "Saras! Aage vadhiye.",
-    "bn": "Bhalo! Egiye jai.",
-}
-
 def detect_language_preference(text: str) -> str | None:
     """
     Parse a user's language-preference response.
@@ -990,91 +1127,63 @@ def detect_language_preference(text: str) -> str | None:
 
     return None  # Default — keep current language
 
-# ── Multilingual UI strings ────────────────────────────────────────────────────
+# ── Multilingual UI strings (only substantive prompts — no filler acks) ───────
 STRINGS = {
     "en": {
-        "thanks_name":     "Great, {}! Let's continue.",
-        "cancel_bye":      "Thank you for your time. Have a great day!",
-        "repeat_q":        "No problem, let me repeat: {}",
-        "resume_journey":  "Let's continue from where we left off. {}",
-        "resume_confused": "Let me repeat that — {}",
-        "not_ready":       "No worries! Reach out whenever you're ready.",
-        "no_info_yet":     "I don't have your {} on file yet.",
-        "phone_reask":     "I need a 10-digit WhatsApp number — could you share it again?",
-        "network_reask":   "Could you give me a rough number for your network?",
-        "noted":           "Got it!",
+        "cancel_bye":    "Thank you for your time. Have a great day!",
+        "not_ready":     "No worries! Reach out whenever you're ready.",
+        "no_info_yet":   "I don't have your {} on file yet.",
+        "phone_reask":   "I need a 10-digit WhatsApp number — could you share it again?",
+        "network_reask": "Could you give me a rough number for your network?",
+        "asr_error":     "Sorry, could you please say that again?",
     },
     "hi": {
-        "thanks_name":     "बढ़िया, {} जी! आगे बढ़ते हैं।",
-        "cancel_bye":      "अपना समय देने के लिए धन्यवाद। आपका दिन शुभ हो।",
-        "repeat_q":        "कोई बात नहीं, मैं सवाल दोहराती हूं: {}",
-        "resume_journey":  "चलिए अधूरी यात्रा को शुरू करते हैं। {}",
-        "resume_confused": "अगर फिर से शुरू करें तो — {}",
-        "not_ready":       "ठीक है, जब आप तैयार हों तब वापस आइए।",
-        "no_info_yet":     "मुझे अभी तक आपका {} नहीं मिला है।",
-        "phone_reask":     "10 अंकों का WhatsApp number चाहिए — एक बार फिर बताइए।",
-        "network_reask":   "Roughly कितने contacts हैं? अनुमान भी बताइए।",
-        "noted":           "नोट कर लिया!",
+        "cancel_bye":    "अपना समय देने के लिए धन्यवाद। आपका दिन शुभ हो।",
+        "not_ready":     "ठीक है, जब आप तैयार हों तब वापस आइए।",
+        "no_info_yet":   "मुझे अभी तक आपका {} नहीं मिला है।",
+        "phone_reask":   "10 अंकों का WhatsApp number चाहिए — एक बार फिर बताइए।",
+        "network_reask": "Roughly कितने contacts हैं? अनुमान भी बताइए।",
+        "asr_error":     "माफ़ कीजिए, एक बार फिर बोलिए।",
     },
     "ta": {
-        "thanks_name":     "நன்றி, {}! தொடரலாம்.",
-        "cancel_bye":      "உங்கள் நேரத்திற்கு நன்றி. நல்ல நாள்!",
-        "repeat_q":        "பரவாயில்லை, மீண்டும் கேட்கிறேன்: {}",
-        "resume_journey":  "நிறுத்திய இடத்திலிருந்து தொடரலாம். {}",
-        "resume_confused": "மீண்டும் சொல்கிறேன் — {}",
-        "not_ready":       "பரவாயில்லை! தயாரானபோது தொடர்பு கொள்ளுங்கள்.",
-        "no_info_yet":     "இன்னும் உங்கள் {} கிடைக்கவில்லை.",
-        "phone_reask":     "10 இலக்க WhatsApp number தேவை — மீண்டும் சொல்லுங்கள்.",
-        "network_reask":   "தோராயமாக எத்தனை contacts இருக்கிறார்கள்?",
-        "noted":           "குறித்துக் கொண்டேன்!",
+        "cancel_bye":    "உங்கள் நேரத்திற்கு நன்றி. நல்ல நாள்!",
+        "not_ready":     "பரவாயில்லை! தயாரானபோது தொடர்பு கொள்ளுங்கள்.",
+        "no_info_yet":   "இன்னும் உங்கள் {} கிடைக்கவில்லை.",
+        "phone_reask":   "10 இலக்க WhatsApp number தேவை — மீண்டும் சொல்லுங்கள்.",
+        "network_reask": "தோராயமாக எத்தனை contacts இருக்கிறார்கள்?",
+        "asr_error":     "மன்னிக்கவும், மீண்டும் சொல்ல முடியுமா?",
     },
     "te": {
-        "thanks_name":     "ధన్యవాదాలు, {}! కొనసాగిద్దాం.",
-        "cancel_bye":      "మీ సమయానికి ధన్యవాదాలు. మంచి రోజు!",
-        "repeat_q":        "పర్వాలేదు, మళ్ళీ అడుగుతాను: {}",
-        "resume_journey":  "ఆగిన చోటు నుండి కొనసాగిద్దాం. {}",
-        "resume_confused": "మళ్ళీ చెప్తాను — {}",
-        "not_ready":       "పర్వాలేదు! సిద్ధంగా ఉన్నప్పుడు సంప్రదించండి.",
-        "no_info_yet":     "ఇంకా మీ {} అందలేదు.",
-        "phone_reask":     "10 అంకెల WhatsApp number కావాలి — మళ్ళీ చెప్పండి.",
-        "network_reask":   "దాదాపు ఎంత మంది contacts ఉన్నారు?",
-        "noted":           "గుర్తు పెట్టుకున్నాను!",
+        "cancel_bye":    "మీ సమయానికి ధన్యవాదాలు. మంచి రోజు!",
+        "not_ready":     "పర్వాలేదు! సిద్ధంగా ఉన్నప్పుడు సంప్రదించండి.",
+        "no_info_yet":   "ఇంకా మీ {} అందలేదు.",
+        "phone_reask":   "10 అంకెల WhatsApp number కావాలి — మళ్ళీ చెప్పండి.",
+        "network_reask": "దాదాపు ఎంత మంది contacts ఉన్నారు?",
+        "asr_error":     "క్షమించండి, మళ్ళీ చెప్పగలరా?",
     },
     "mr": {
-        "thanks_name":     "धन्यवाद, {}! पुढे जाऊया.",
-        "cancel_bye":      "वेळ दिल्याबद्दल धन्यवाद. शुभ दिवस!",
-        "repeat_q":        "ठीक आहे, पुन्हा विचारतो: {}",
-        "resume_journey":  "थांबलो होतो तिथून पुढे जाऊया. {}",
-        "resume_confused": "पुन्हा सांगतो — {}",
-        "not_ready":       "ठीक आहे! तयार झाल्यावर संपर्क करा.",
-        "no_info_yet":     "अजून तुमचे {} मिळाले नाही.",
-        "phone_reask":     "10 अंकी WhatsApp number हवा — पुन्हा सांगा.",
-        "network_reask":   "साधारण किती contacts आहेत?",
-        "noted":           "नोंद घेतली!",
+        "cancel_bye":    "वेळ दिल्याबद्दल धन्यवाद. शुभ दिवस!",
+        "not_ready":     "ठीक आहे! तयार झाल्यावर संपर्क करा.",
+        "no_info_yet":   "अजून तुमचे {} मिळाले नाही.",
+        "phone_reask":   "10 अंकी WhatsApp number हवा — पुन्हा सांगा.",
+        "network_reask": "साधारण किती contacts आहेत?",
+        "asr_error":     "माफ करा, पुन्हा सांगाल का?",
     },
     "gu": {
-        "thanks_name":     "આભાર, {}! ચાલુ રાખીએ.",
-        "cancel_bye":      "સમય આપવા માટે આભાર. સારો દિવસ!",
-        "repeat_q":        "ઠીક છે, ફરી પૂછું છું: {}",
-        "resume_journey":  "અટક્યા ત્યાંથી ચાલુ રાખીએ. {}",
-        "resume_confused": "ફરીથી કહું — {}",
-        "not_ready":       "ઠીક છે! તૈયાર થાઓ ત્યારે સંપર્ક કરો.",
-        "no_info_yet":     "હજી તમારું {} મળ્યું નથી.",
-        "phone_reask":     "10 આંકડાનો WhatsApp number જોઈએ — ફરી કહો.",
-        "network_reask":   "આશરે કેટલા contacts છે?",
-        "noted":           "નોંધ લીધી!",
+        "cancel_bye":    "સમય આપવા માટે આભાર. સારો દિવસ!",
+        "not_ready":     "ઠીક છે! તૈયાર થાઓ ત્યારે સંપર્ક કરો.",
+        "no_info_yet":   "હજી તમારું {} મળ્યું નથી.",
+        "phone_reask":   "10 આંકડાનો WhatsApp number જોઈએ — ફરી કહો.",
+        "network_reask": "આશરે કેટલા contacts છે?",
+        "asr_error":     "માફ કરો, ફરી કહેશો?",
     },
     "bn": {
-        "thanks_name":     "ধন্যবাদ, {}! চলুন এগিয়ে যাই।",
-        "cancel_bye":      "আপনার সময়ের জন্য ধন্যবাদ। শুভ দিন!",
-        "repeat_q":        "ঠিক আছে, আবার বলছি: {}",
-        "resume_journey":  "যেখানে ছিলাম সেখান থেকে শুরু করি। {}",
-        "resume_confused": "আবার বলছি — {}",
-        "not_ready":       "ঠিক আছে! প্রস্তুত হলে যোগাযোগ করুন।",
-        "no_info_yet":     "এখনো আপনার {} পাইনি।",
-        "phone_reask":     "10 সংখ্যার WhatsApp number দরকার — আবার বলুন।",
-        "network_reask":   "মোটামুটি কতজন contacts আছেন?",
-        "noted":           "নোট করা হয়েছে!",
+        "cancel_bye":    "আপনার সময়ের জন্য ধন্যবাদ। শুভ দিন!",
+        "not_ready":     "ঠিক আছে! প্রস্তুত হলে যোগাযোগ করুন।",
+        "no_info_yet":   "এখনো আপনার {} পাইনি।",
+        "phone_reask":   "10 সংখ্যার WhatsApp number দরকার — আবার বলুন।",
+        "network_reask": "মোটামুটি কতজন contacts আছেন?",
+        "asr_error":     "দুঃখিত, আবার বলবেন?",
     },
 }
 
@@ -1150,12 +1259,33 @@ def detect_language(text: str) -> str:
 
 def get_session(ws):
     return SESSIONS.setdefault(ws.data["sessionId"], {
+        # questionnaire
         "unanswered_required": [q["id"] for q in QUESTIONNAIRE if q.get("required")],
         "unanswered_optional": [q["id"] for q in QUESTIONNAIRE if not q.get("required")],
-        "answers": {},
+        "answers":          {},
         "intent_confirmed": False,
-        "lang_confirmed": False,
-        "last_asked_qid": None,
+        "lang_confirmed":   False,
+        "last_asked_qid":   None,
+        # stage machine
+        "stage":            "INTRO",
+        "turn_count":       0,
+        "pitch_attempts":   0,
+        "discovery_done":   False,
+        # persona + conversation
+        "persona":          "",
+        "sentiment":        "neutral",
+        "gender":           "male",
+        # objection lifecycle
+        "objections":       [],
+        # weighted lead score
+        "lead_score_components": {
+            "intent": 0, "readiness": 0, "fit": 0,
+            "engagement": 10, "objection_resolution": 0, "sentiment": 50,
+        },
+        "lead_score_total": 0,
+        # interrupt control
+        "tts_cancel": threading.Event(),
+        "tts_active": False,
     })
 
 def get_next_question(session):
@@ -1186,6 +1316,149 @@ def get_next_k_questions(session, count=3):
     questions = [q for q in QUESTIONNAIRE if q["id"] in next_ids]
 
     return questions
+
+
+# ── Multi-intent + sentiment + RAG + stage helpers ────────────────────────────
+
+def detect_multi_intent(text: str, top_k: int = 3) -> list[tuple[str, float]]:
+    """Return top-k (intent, confidence) pairs. confidence = 1 - distance."""
+    embedding = sentenceTransformerModel.encode(text, normalize_embeddings=True).tolist()
+    result = intent_collection.query(query_embeddings=[embedding], n_results=top_k)
+    intents: list[tuple[str, float]] = []
+    try:
+        for meta, dist in zip(result["metadatas"][0], result["distances"][0]):
+            confidence = round(max(0.0, 1.0 - float(dist)), 3)
+            intents.append((meta["intent"], confidence))
+    except (IndexError, KeyError, TypeError):
+        pass
+    return intents
+
+
+def detect_sentiment(text: str) -> str:
+    t = text.lower()
+    scores = {s: sum(1 for kw in kws if kw in t) for s, kws in SENTIMENT_KEYWORDS.items()}
+    best = max(scores, key=scores.get)
+    return best if scores[best] > 0 else "neutral"
+
+
+def retrieve_rag_context(query: str, persona: str = "", top_k: int = 3) -> str:
+    """Retrieve the most relevant Rupeezy AP knowledge snippets for the LLM."""
+    if kb_collection is None:
+        return ""
+    try:
+        search = f"{query} {persona}".strip()
+        emb = sentenceTransformerModel.encode(search, normalize_embeddings=True).tolist()
+        result = kb_collection.query(query_embeddings=[emb], n_results=top_k)
+        docs = result.get("documents", [[]])[0]
+        return " | ".join(docs) if docs else ""
+    except Exception:
+        return ""
+
+
+def advance_stage(sess: dict, primary_intent: str, sentiment: str) -> bool:
+    """Transition the session stage based on conversation signals. Returns True if changed."""
+    stage = sess.get("stage", "INTRO")
+
+    if stage == "INTRO":
+        if sess.get("lang_confirmed"):
+            sess["stage"] = "DISCOVERY"
+            return True
+
+    elif stage == "DISCOVERY":
+        sess["turn_count"] = sess.get("turn_count", 0) + 1
+        if sess["turn_count"] >= 1 or primary_intent in ("interested", "intent_confirmed", "enquiry"):
+            sess["stage"] = "PITCH"
+            return True
+
+    elif stage == "PITCH":
+        if primary_intent.startswith("obj_"):
+            existing = [o for o in sess.get("objections", []) if o["type"] == primary_intent]
+            if not existing:
+                sess.setdefault("objections", []).append(
+                    {"type": primary_intent, "resolved": False, "confidence": 0.8}
+                )
+            sess["stage"] = "OBJECTION_HANDLING"
+            return True
+        if primary_intent in ("interested", "intent_confirmed") or sentiment in ("high_intent", "positive"):
+            sess["stage"] = "QUALIFICATION"
+            return True
+        sess["pitch_attempts"] = sess.get("pitch_attempts", 0) + 1
+        if sess["pitch_attempts"] >= 2:
+            sess["stage"] = "QUALIFICATION"
+            return True
+
+    elif stage == "OBJECTION_HANDLING":
+        for o in sess.get("objections", []):
+            if not o["resolved"]:
+                o["resolved"] = True
+                break
+        if primary_intent in ("interested", "intent_confirmed") or sentiment in ("high_intent", "positive"):
+            sess["stage"] = "QUALIFICATION"
+        else:
+            sess["stage"] = "PITCH"
+        return True
+
+    elif stage == "QUALIFICATION":
+        if not sess.get("unanswered_required"):
+            sess["stage"] = "CTA"
+            return True
+
+    elif stage == "CTA":
+        if primary_intent in ("interested", "intent_confirmed") or sentiment == "high_intent":
+            sess["stage"] = "HANDOFF"
+            return True
+        if primary_intent in ("cancel", "not_interested") or sentiment == "frustrated":
+            sess["stage"] = "END"
+            return True
+
+    return False
+
+
+def update_lead_score_components(sess: dict, intents: list[tuple[str, float]], sentiment: str) -> None:
+    """Update the 6 weighted score components based on conversation signals."""
+    sc = sess.setdefault("lead_score_components", {
+        "intent": 0, "readiness": 0, "fit": 0,
+        "engagement": 10, "objection_resolution": 0, "sentiment": 50,
+    })
+    answers      = sess.get("answers", {})
+    primary_intent = intents[0][0] if intents else "unknown"
+
+    sc["engagement"] = min(80, sc["engagement"] + 5)
+
+    if primary_intent in ("interested", "intent_confirmed"):
+        sc["intent"] = max(sc["intent"], 70)
+    if sentiment == "high_intent":
+        sc["intent"]    = 100
+        sc["readiness"] = max(sc["readiness"], 80)
+    elif sentiment == "positive":
+        sc["intent"]   = max(sc["intent"], 50)
+        sc["sentiment"] = min(100, sc["sentiment"] + 10)
+    elif sentiment == "hesitant":
+        sc["readiness"] = max(0, sc["readiness"] - 10)
+    elif sentiment == "frustrated":
+        sc["sentiment"] = max(0, sc["sentiment"] - 20)
+        sc["engagement"] = max(0, sc["engagement"] - 15)
+    else:
+        sc["sentiment"] = min(100, sc["sentiment"] + 3)
+
+    try:
+        n = int(answers.get("network_size", 0))
+        if n >= 50:   sc["fit"] = 100
+        elif n >= 20: sc["fit"] = 70
+        elif n >= 5:  sc["fit"] = 40
+    except (ValueError, TypeError):
+        pass
+
+    if answers.get("phone"):
+        sc["readiness"] = min(100, sc["readiness"] + 30)
+
+    objections = sess.get("objections", [])
+    if objections:
+        resolved = sum(1 for o in objections if o.get("resolved"))
+        sc["objection_resolution"] = int(resolved / len(objections) * 100)
+
+    if primary_intent.startswith("obj_"):
+        sc["readiness"] = max(0, sc["readiness"] - 5)
 
 
 #######################################################################################
@@ -1414,111 +1687,261 @@ FIELD_NAMES_HINDI = {
     "phone":          "WhatsApp number",
 }
 
-async def recall_and_confirm(field: str, value: str, q_queue: queue.Queue):
-    """Generate recall response for stored Rupeezy AP answers"""
-    recalls = {
-        "name":           f"आपका नाम मैंने {value} जी के रूप में नोट किया था",
-        "profession":     f"आपने बताया था कि आप {value} हैं",
-        "network_size":   f"आपने बताया था कि आपके contacts में roughly {value} लोग हैं",
-        "city":           f"आपका शहर {value} दर्ज है",
-        "current_broker": f"आपने बताया था: current broker — {value}",
-        "phone":          f"आपका WhatsApp number {value} रिकॉर्ड किया गया है",
-    }
-    q_queue.put(recalls.get(field, "मैंने यह जानकारी रिकॉर्ड की है"))
+RECALL_TEMPLATES: dict[str, dict[str, str]] = {
+    "hi": {
+        "name":           "आपका नाम मैंने {value} जी के रूप में नोट किया था।",
+        "profession":     "आपने बताया था कि आप {value} हैं।",
+        "network_size":   "आपने बताया था कि आपके contacts में roughly {value} लोग हैं।",
+        "city":           "आपका शहर {value} दर्ज है।",
+        "current_broker": "आपने बताया था: current broker — {value}।",
+        "phone":          "आपका WhatsApp number {value} रिकॉर्ड किया गया है।",
+        "_default":       "मैंने यह जानकारी रिकॉर्ड की है।",
+    },
+    "en": {
+        "name":           "I have your name on file as {value}.",
+        "profession":     "You mentioned your profession as {value}.",
+        "network_size":   "You said roughly {value} people in your contacts.",
+        "city":           "You're based in {value}.",
+        "current_broker": "Current broker on file: {value}.",
+        "phone":          "Your WhatsApp number on file is {value}.",
+        "_default":       "I have that on file.",
+    },
+    "ta": {
+        "name":           "உங்கள் பெயர் {value} என பதிவு செய்துள்ளேன்.",
+        "profession":     "உங்கள் தொழில் {value} என குறிப்பிட்டீர்கள்.",
+        "network_size":   "உங்கள் contacts-ல் சுமார் {value} பேர் என குறிப்பிட்டீர்கள்.",
+        "city":           "நீங்கள் {value} நகரத்தைச் சேர்ந்தவர்.",
+        "current_broker": "உங்கள் current broker: {value}.",
+        "phone":          "உங்கள் WhatsApp number {value} பதிவு செய்துள்ளேன்.",
+        "_default":       "அது பதிவு செய்யப்பட்டுள்ளது.",
+    },
+    "te": {
+        "name":           "మీ పేరు {value} గా రికార్డ్ చేశాను.",
+        "profession":     "మీ profession {value} అని చెప్పారు.",
+        "network_size":   "మీ contacts లో దాదాపు {value} మంది అని చెప్పారు.",
+        "city":           "మీరు {value} నగరం వారు.",
+        "current_broker": "మీ current broker: {value}.",
+        "phone":          "మీ WhatsApp number {value} రికార్డ్ చేశాను.",
+        "_default":       "అది రికార్డ్ చేయబడింది.",
+    },
+    "mr": {
+        "name":           "तुमचे नाव {value} असे नोंदवले आहे.",
+        "profession":     "तुम्ही profession {value} सांगितले होते.",
+        "network_size":   "तुमच्या contacts मध्ये साधारण {value} लोक सांगितले होते.",
+        "city":           "तुम्ही {value} शहरातून आहात.",
+        "current_broker": "तुमचा current broker: {value}.",
+        "phone":          "तुमचा WhatsApp number {value} नोंदवला आहे.",
+        "_default":       "ते नोंदवले आहे.",
+    },
+    "gu": {
+        "name":           "તમારું નામ {value} તરીકે નોંધાયું છે.",
+        "profession":     "તમે profession {value} કહ્યું હતું.",
+        "network_size":   "તમારા contacts માં લગભગ {value} લોકો કહ્યું હતું.",
+        "city":           "તમે {value} શહેરના છો.",
+        "current_broker": "તમારો current broker: {value}.",
+        "phone":          "તમારો WhatsApp number {value} નોંધાયો છે.",
+        "_default":       "તે નોંધાયું છે.",
+    },
+    "bn": {
+        "name":           "আপনার নাম {value} হিসেবে নথিভুক্ত করেছি।",
+        "profession":     "আপনি বলেছিলেন আপনি {value}।",
+        "network_size":   "আপনার contacts-এ প্রায় {value} জন আছেন বলেছিলেন।",
+        "city":           "আপনি {value} শহরের।",
+        "current_broker": "আপনার current broker: {value}।",
+        "phone":          "আপনার WhatsApp number {value} নথিভুক্ত করা হয়েছে।",
+        "_default":       "এটা নথিভুক্ত করা হয়েছে।",
+    },
+}
+
+async def recall_and_confirm(field: str, value: str, q_queue: queue.Queue, lang: str = "hi"):
+    """Speak back a stored answer in the lead's language."""
+    table = RECALL_TEMPLATES.get(lang) or RECALL_TEMPLATES["hi"]
+    template = table.get(field, table["_default"])
+    q_queue.put(template.format(value=value))
 
 
 # ---------------------------------------------------------------------------
 # Objection rebuttals
 # ---------------------------------------------------------------------------
-OBJECTION_REBUTTALS = {
-    "obj_already_broker": (
-        "Bilkul samajh sakte hain! But Rupeezy ke saath aap apna existing network leverage kar sakte hain — "
-        "zero joining fee, 100% brokerage share, aur daily payouts. "
-        "Dono platforms simultaneously run kar sakte hain — koi conflict nahi."
-    ),
-    "obj_no_contacts": (
-        "Koi baat nahi! Start small — even 5-10 contacts jo invest karna chahte hain kaafi hain. "
-        "Rupeezy ka dedicated RM aapko har step pe guide karega. "
-        "Sign-up ke baad training bhi milti hai contacts expand karne ke liye."
-    ),
-    "obj_support": (
-        "Aapki concern valid hai. Isliye Rupeezy ne dedicated RM support diya hai — "
-        "ek real person jo aapke saath hai, 24x7 helpline nahi. "
-        "Onboarding se lekar first payout tak full hand-holding milegi."
-    ),
-    "obj_trust": (
-        "Rupeezy ek SEBI-registered broker hai — fully regulated. "
-        "Aapka paisa aur aapke clients ka paisa completely safe hai. "
-        "Thousands of partners already earning daily payouts — yeh verified program hai."
-    ),
-    "obj_think_later": (
-        "Sure, time lo! But ek baat batao — joining fee toh hai hi nahi, toh risk bhi zero hai. "
-        "Aaj sirf registration kar lo, start kabhi bhi karo jab ready ho."
-    ),
+# Objection rebuttals come straight from objections.json (compliance-approved
+# wording). Falls back to a neutral redirect if a rebuttal is missing.
+OBJECTION_REBUTTALS: dict[str, str] = {
+    obj_id: data.get("response", "").strip()
+    for obj_id, data in KB_OBJECTIONS.items()
+    if data.get("response")
 }
 
 
+# Compliance block — restricted phrases + behavioural rules from compliance.json
+def _build_compliance_block() -> str:
+    parts: list[str] = []
+    rules = KB_COMPLIANCE.get("rules", [])
+    if rules:
+        parts.append("COMPLIANCE: " + " ".join(f"{r}." for r in rules))
+    restricted = KB_COMPLIANCE.get("restricted_claims", [])
+    if restricted:
+        parts.append(f"Never use phrases like: {', '.join(restricted)}.")
+    return " ".join(parts)
+
+COMPLIANCE_BLOCK: str = _build_compliance_block()
+
+# Benefits block — single sentence built from regulations + scripts + onboarding,
+# threaded into the system prompt so the model can weave verified facts naturally.
+def _build_benefits_block() -> str:
+    reg = KB_REGULATIONS
+    return (
+        "VERIFIED FACTS (use these, never invent): "
+        "Zero joining fee. 100% brokerage sharing. Daily payouts via RISE partner portal. "
+        f"Operated by {reg.get('company', '')} — SEBI registered ({reg.get('sebi_registration', '')}), "
+        f"NSE/BSE/MCX member. {reg.get('years_in_market', '20+')} years of market presence. "
+        f"Onboarding: {KB_ONBOARDING.get('timeline', 'within 24 hours')} after document submission."
+    )
+
+BENEFITS_BLOCK: str = _build_benefits_block()
+
+# Weights + thresholds come from qualification.json (source of truth)
+_qw = KB_QUAL.get("weights", {})
+LEAD_SCORE_WEIGHTS: dict[str, float] = {
+    "intent":               _qw.get("intent",               30) / 100.0,
+    "readiness":            _qw.get("readiness",            25) / 100.0,
+    "fit":                  _qw.get("fit_network",          20) / 100.0,
+    "engagement":           _qw.get("engagement",           10) / 100.0,
+    "objection_resolution": _qw.get("objection_resolution", 10) / 100.0,
+    "sentiment":            _qw.get("sentiment",             5) / 100.0,
+}
+_qt = KB_QUAL.get("thresholds", {})
+LEAD_SCORE_HOT  = _qt.get("HOT",  75)
+LEAD_SCORE_WARM = _qt.get("WARM", 45)
+
+
 def compute_lead_score(sess: dict) -> str:
-    score = 0
-    answers = sess.get("answers", {})
-
-    # Network size
-    try:
-        n = int(answers.get("network_size", 0))
-        if n >= 50:
-            score += 3
-        elif n >= 20:
-            score += 2
-        elif n >= 5:
-            score += 1
-    except (ValueError, TypeError):
-        pass
-
-    if sess.get("intent_confirmed"):
-        score += 3
-    if answers.get("phone"):
-        score += 2
-
-    objections_raised   = set(sess.get("objections_raised", []))
-    objections_resolved = set(sess.get("objections_resolved", []))
-    unresolved = objections_raised - objections_resolved
-    score -= len(unresolved)
-    if "obj_think_later" in objections_raised:
-        score -= 1
-
-    if score >= 6:
-        return "Hot"
-    if score >= 3:
-        return "Warm"
+    """Weighted 6-component lead scoring driven by qualification.json."""
+    sc = sess.get("lead_score_components", {})
+    total = sum(sc.get(k, 0) * w for k, w in LEAD_SCORE_WEIGHTS.items())
+    total = round(min(100.0, max(0.0, total)), 1)
+    sess["lead_score_total"] = total
+    if total >= LEAD_SCORE_HOT:  return "Hot"
+    if total >= LEAD_SCORE_WARM: return "Warm"
     return "Cold"
 
 
-def generate_post_call_summary(sess: dict, session_id: str) -> dict:
-    answers = sess.get("answers", {})
-    lead_score = compute_lead_score(sess)
+# ── Multilingual objection rebuttals ──────────────────────────────────────────
+# OBJECTION_REBUTTALS holds the JSON-derived (English) source of truth.
+# OBJECTION_REBUTTALS_LANG layers translations on top so direct-TTS rebuttal
+# paths (used in the QUALIFICATION stage) speak the lead's language.
+# Lookup helper get_rebuttal() falls back to English if a translation is missing.
+OBJECTION_REBUTTALS_LANG: dict[str, dict[str, str]] = {
+    "hi": {
+        "obj_already_broker": "बढ़िया sir — matlab business already aap samajhte hain. Ek baat puchhna chahti hoon: kya aapko wahan 100% brokerage sharing aur daily payouts mil rahe hain?",
+        "obj_no_contacts":    "Bahut partners apne existing network se hi shuru karte hain — current clients, friends, family aur local references. Time ke saath referrals organically grow karte hain.",
+        "obj_support":        "Aap chinta mat kijiye sir, Rupeezy backend operational support aur dedicated RM assistance deti hai — partner aur client dono ke liye.",
+        "obj_trust":          "Rupeezy ka 20+ saal ka market presence hai aur partner portal ke through complete transparency milti hai.",
+        "obj_think_later":    "Bilkul sir, koi problem nahi. Main details aur signup link WhatsApp pe bhej deti hoon, aaram se review kar lijiyega.",
+    },
+    "en": {
+        "obj_already_broker": "That's great sir — then you already understand this business well. My question is: are you getting 100% brokerage sharing and daily payouts there as well?",
+        "obj_no_contacts":    "Many partners actually begin with their existing network itself — current clients, friends, family, and local references.",
+        "obj_support":        "Don't worry sir, Rupeezy provides backend operational support and dedicated RM assistance.",
+        "obj_trust":          "Rupeezy has over 20 years of market presence and provides complete transparency through its systems and partner portal.",
+        "obj_think_later":    "Absolutely sir, no problem at all. I'll share the details and signup link on WhatsApp so you can review comfortably.",
+    },
+    "ta": {
+        "obj_already_broker": "Sari sir — antha business unga-kku already therinjirukku. Oru kelvi: angu 100% brokerage sharing-um daily payouts-um kidaikkudha?",
+        "obj_no_contacts":    "Niraiya partners thanga existing network-il-irundhu thaan start pannraanga — current clients, friends, family, local references.",
+        "obj_support":        "Kavalai padatheenga sir — Rupeezy backend operational support-um dedicated RM assistance-um tharudhu.",
+        "obj_trust":          "Rupeezy-kku 20 varushattha mela market presence iruku, partner portal moolam complete transparency kidaikkum.",
+        "obj_think_later":    "Sari sir, problem illai. Naan details-um signup link-um WhatsApp-il anuppuren, neenga aaramaa review pannikko.",
+    },
+    "te": {
+        "obj_already_broker": "Manchidi sir — ee business meeku already telusu. Naa prashna: akkada meeku 100% brokerage sharing-um daily payouts-um vastunnaya?",
+        "obj_no_contacts":    "Chala partners thama existing network nundi-ne start chestaaru — current clients, friends, family, local references.",
+        "obj_support":        "Anduku worry kavalsina pani ledu sir — Rupeezy backend operational support-um dedicated RM assistance-um istundi.",
+        "obj_trust":          "Rupeezy ki 20+ samvatsaralu market presence undi, partner portal dwara complete transparency vastundi.",
+        "obj_think_later":    "Sari sir, edi problem ledu. Naa details-um signup link-um WhatsApp-lo pampistanu, meeru tirikadigi review cheskovachhu.",
+    },
+    "mr": {
+        "obj_already_broker": "Chhan sir — mhanje business tumhi already samjta. Ek prashna: tithe tumhala 100% brokerage sharing aani daily payouts miltayet ka?",
+        "obj_no_contacts":    "Bahut partners apalya existing network pasunach suruvat kartat — current clients, mitra, kutumb aani local references.",
+        "obj_support":        "Kalji karu naka sir — Rupeezy backend operational support aani dedicated RM assistance deta.",
+        "obj_trust":          "Rupeezy cha 20+ varshancha market presence aahe, partner portal madhun complete transparency milte.",
+        "obj_think_later":    "Bilkul sir, kahi harkat nahi. Mi details aani signup link WhatsApp varti pathavate, tumhi nivantpane review kara.",
+    },
+    "gu": {
+        "obj_already_broker": "Saru sir — etle business tame pehlethi samjho cho. Ek prashna: tya tamne 100% brokerage sharing ane daily payouts male chhe?",
+        "obj_no_contacts":    "Ghana partners potana existing network thi j shuruaat kare chhe — current clients, mitra, parivaar ane local references.",
+        "obj_support":        "Chinta na karo sir — Rupeezy backend operational support ane dedicated RM assistance aape chhe.",
+        "obj_trust":          "Rupeezy no 20+ varshno market presence chhe, partner portal thi puri transparency male chhe.",
+        "obj_think_later":    "Bilkul sir, koi vandho nathi. Hu details ane signup link WhatsApp par mokli daish, tame nirante review kari shako.",
+    },
+    "bn": {
+        "obj_already_broker": "Bhalo sir — manei e business apni already bojhen. Amar ekta proshno: okhane apni 100% brokerage sharing ar daily payouts paachhen?",
+        "obj_no_contacts":    "Onek partner taader existing network theke shuru koren — current clients, bondhu, poribar ar local references.",
+        "obj_support":        "Chinta korben na sir — Rupeezy backend operational support ar dedicated RM assistance dey.",
+        "obj_trust":          "Rupeezy-r 20+ bochhorer market presence achhe, partner portal-er madhyome puro transparency paowa jaay.",
+        "obj_think_later":    "Bilkul sir, kono ashubidha nei. Ami details ar signup link WhatsApp-e pathiye debo, apni shantite review koren.",
+    },
+}
 
-    if lead_score == "Hot":
-        recommended_action = "Immediate RM handoff — high intent + large network."
-    elif lead_score == "Warm":
-        recommended_action = "Send WhatsApp follow-up with sign-up link within 1 hour."
-    else:
-        recommended_action = "Add to nurture pipeline — re-contact after 7 days."
+def get_rebuttal(intent: str, lang: str) -> str:
+    """Return objection rebuttal in lead's language; fall back to English source of truth."""
+    return (OBJECTION_REBUTTALS_LANG.get(lang, {}).get(intent)
+            or OBJECTION_REBUTTALS.get(intent, ""))
+
+
+def generate_post_call_summary(sess: dict, session_id: str) -> dict:
+    answers    = sess.get("answers", {})
+    lead_score = compute_lead_score(sess)
+    score_num  = sess.get("lead_score_total", 0)
+    objections = sess.get("objections", [])
+    persona    = sess.get("persona") or answers.get("profession", "")
+
+    action_map = {
+        "Hot":  "Immediate RM handoff — high intent + strong profile. RM to call within 2 hours.",
+        "Warm": "Send WhatsApp signup link within 1 hour. Follow-up call in 48h if no action.",
+        "Cold": "Add to 30-day nurture pipeline. Re-contact with fresh content.",
+    }
+    next_step_map = {
+        "Hot":  "RM to call within 2 hours",
+        "Warm": "Send WhatsApp signup link",
+        "Cold": "Schedule 30-day nurture re-contact",
+    }
+    city    = answers.get("city", "")
+    network = answers.get("network_size", "?")
+
+    # WhatsApp body — pulled from whatsapp_templates.json so the RM can send
+    # the same approved copy without copy/paste drift.
+    lang = sess.get("lang", "hi")
+    wa_lang_key = "hindi" if lang == "hi" else "english"
+    wa_template_key = "hot_lead" if lead_score == "Hot" else ("warm_lead" if lead_score == "Warm" else None)
+    whatsapp_body = ""
+    if wa_template_key:
+        wa_block = KB_WHATSAPP.get(wa_template_key, {})
+        whatsapp_body = wa_block.get(wa_lang_key, "") or wa_block.get("english", "")
 
     return {
         "session_id":          session_id,
         "lead_name":           answers.get("name", ""),
-        "city":                answers.get("city", ""),
-        "network_size":        answers.get("network_size", ""),
+        "language":            lang,
+        "persona":             persona,
+        "city":                city,
+        "network_size":        network,
         "current_broker":      answers.get("current_broker", ""),
         "phone":               answers.get("phone", ""),
         "profession":          answers.get("profession", ""),
-        "lang":                sess.get("lang", "hi"),
         "lead_score":          lead_score,
-        "objections_raised":   sess.get("objections_raised", []),
-        "objections_resolved": sess.get("objections_resolved", []),
+        "score":               score_num,
+        "score_components":    sess.get("lead_score_components", {}),
+        "final_stage":         sess.get("stage", "END"),
+        "objections":          objections,
+        "objections_raised":   [o["type"] for o in objections],
+        "objections_resolved": [o["type"] for o in objections if o.get("resolved")],
         "intent_confirmed":    sess.get("intent_confirmed", False),
-        "recommended_action":  recommended_action,
+        "recommended_action":  action_map.get(lead_score, action_map["Cold"]),
+        "next_step":           next_step_map.get(lead_score, next_step_map["Cold"]),
+        "whatsapp_body":       whatsapp_body,
         "topics_covered":      list(answers.keys()),
+        "sentiment_trajectory": sess.get("sentiment", "neutral"),
+        "summary":             f"{persona} from {city}, network of {network} investors, scored {score_num:.0f}/100 ({lead_score}).",
         "transcript":          [],
     }
 
@@ -1529,10 +1952,11 @@ async def handle_intent(user_text: str, ws, sess: dict, q_queue: queue.Queue) ->
 
     if intent.startswith("recall_"):
         field = intent.replace("recall_", "")
+        lang_local = sess.get("lang", "hi")
         if field in sess.get("answers", {}):
-            await recall_and_confirm(field, sess["answers"][field], q_queue)
+            await recall_and_confirm(field, sess["answers"][field], q_queue, lang_local)
         else:
-            q_queue.put(S("no_info_yet", sess.get("lang", "hi")))
+            q_queue.put(S("no_info_yet", lang_local, FIELD_NAMES_HINDI.get(field, field)))
         return True
 
     if intent == "interested":
@@ -1555,7 +1979,7 @@ async def handle_intent(user_text: str, ws, sess: dict, q_queue: queue.Queue) ->
         lang = sess.get("lang", "hi")
         if intent not in sess.get("objections_raised", []):
             sess.setdefault("objections_raised", []).append(intent)
-        rebuttal = OBJECTION_REBUTTALS.get(intent)
+        rebuttal = get_rebuttal(intent, lang)
         if rebuttal:
             q_queue.put(rebuttal)
         # Treat any objection as implicit engagement — enable questionnaire after rebuttal
@@ -1572,7 +1996,6 @@ async def handle_intent(user_text: str, ws, sess: dict, q_queue: queue.Queue) ->
         if session_id in SESSIONS:
             del SESSIONS[session_id]
         q_queue.put(S("cancel_bye", lang))
-        await ws.send("FILLER:flow_complete")
         await ws.send("FLOW_CANCELLED")
         return True
 
@@ -1588,10 +2011,9 @@ async def handle_intent(user_text: str, ws, sess: dict, q_queue: queue.Queue) ->
         sess["last_asked_text"] = prompt
         return True
 
-    ## TODO: Why is this needed ?
     elif user_text.strip().lower() in ["नहीं", "nahin", "no"]:
         sess["retry_count"] = 0
-        await ws.send("ठीक है, जब आप तैयार हों तब वापस आइए।")
+        q_queue.put(S("not_ready", sess.get("lang", "hi")))
         return True
 
     return False
@@ -1601,6 +2023,24 @@ async def handle_intent(user_text: str, ws, sess: dict, q_queue: queue.Queue) ->
 # Model initialisation
 # --------------------------
 printLogs("[BOOT] Using Groq API for STT (whisper-large-v3).")
+
+# Build Rupeezy AP knowledge base now that KB_DOCUMENTS constant is available
+def _build_kb_collection():
+    global kb_collection
+    try:
+        kb_col = chroma_client.get_or_create_collection(name="rupeezy_kb")
+        if kb_col.count() == 0:
+            kb_col.add(
+                documents=[doc for doc, _ in KB_DOCUMENTS],
+                embeddings=[sentenceTransformerModel.encode(doc, normalize_embeddings=True).tolist() for doc, _ in KB_DOCUMENTS],
+                metadatas=[{"tag": tag} for _, tag in KB_DOCUMENTS],
+                ids=[f"kb_{i}" for i in range(len(KB_DOCUMENTS))],
+            )
+        kb_collection = kb_col
+        printLogs(f"[BOOT] KB collection ready ({kb_col.count()} docs).")
+    except Exception as e:
+        printLogs(f"[BOOT] KB collection failed: {e}")
+_build_kb_collection()
 
 REF_AUDIO_PATH = os.path.join(os.path.dirname(__file__), '..', '..', '..', 'intro.mp3')
 REF_TEXT       = os.getenv("REF_TEXT", "")  # transcript of intro.mp3; empty = auto-detect
@@ -1640,6 +2080,15 @@ def stream_tts(text: str, ws, main_loop):
         printLogs("WebSocket is not open. Skipping TTS.")
         return
 
+    sess = SESSIONS.get(ws.data.get("sessionId", ""), {})
+    cancel_event: threading.Event = sess.get("tts_cancel", threading.Event())
+
+    if cancel_event.is_set():
+        cancel_event.clear()
+        printLogs("[TTS] Cancelled (interrupt) before generation.")
+        return
+
+    sess["tts_active"] = True
     try:
         audio_list = omnivoice_model.generate(
             text      = text,
@@ -1648,8 +2097,14 @@ def stream_tts(text: str, ws, main_loop):
             instruct  = None,
         )
         if not audio_list:
-            printLogs("[TTS] No audio returned by model.generate(), skipping.")
+            printLogs("[TTS] No audio returned, skipping.")
             return
+
+        if cancel_event.is_set():
+            cancel_event.clear()
+            printLogs("[TTS] Cancelled (interrupt) after generation.")
+            return
+
         audio = audio_list[0]
         if isinstance(audio, torch.Tensor):
             audio = audio.detach().cpu().numpy()
@@ -1664,6 +2119,8 @@ def stream_tts(text: str, ws, main_loop):
         printLogs("Websocket closed. Skipping.")
     except Exception as e:
         printLogs(f"Error in TTS or WebSocket send: {e}")
+    finally:
+        sess["tts_active"] = False
 
 
 # --------------------------
@@ -1721,7 +2178,8 @@ async def process_utterance(utter_bytes: bytes, ws, q_queue):
     except Exception as e:
         printLogs(f"[ASR-ERR] {e}")
         traceback.print_exc()
-        q_queue.put("माफ़ कीजिए, बोल कर दोबारा बताइए।")
+        sess_for_lang = SESSIONS.get(ws.data.get("sessionId", ""), {})
+        q_queue.put(S("asr_error", sess_for_lang.get("lang", "hi")))
         return
 
     sess = get_session(ws)
@@ -1732,35 +2190,24 @@ async def process_utterance(utter_bytes: bytes, ws, q_queue):
     lang = sess["lang"]
     printLogs(f"[LANG] Session language: {lang}")
 
-    # ── Language preference gate (first utterance only) ───────────────────────
+    # ── First-turn handling: silent language switch + go straight to DISCOVERY ─
     if not sess.get("lang_confirmed", False):
         preferred = detect_language_preference(user_text)
         if preferred is not None and preferred != lang:
-            # Lead wants a different language — switch and ack
             sess["lang"] = preferred
             lang = preferred
-            q_queue.put(LANG_SWITCH_ACK.get(lang, LANG_SWITCH_ACK["hi"]))
             printLogs(f"[LANG] Switched to {lang} per lead preference")
-        else:
-            q_queue.put(LANG_CONFIRM_ACK.get(lang, LANG_CONFIRM_ACK["hi"]))
 
         sess["lang_confirmed"] = True
 
-        # Also check for cancel at this stage
         quick_intent = detect_intent_with_chroma(user_text)
         if quick_intent == "cancel":
             q_queue.put(S("cancel_bye", lang))
             await ws.send("FLOW_CANCELLED")
             return
 
-        # Proceed directly to first qualifying question (intro already asked for 2 min)
-        sess["intent_confirmed"] = True
-        next_q = get_next_question(sess)
-        if next_q:
-            prompt = qprompt(next_q, lang)
-            sess["last_asked_qid"] = next_q["id"]
-            sess["last_asked_text"] = prompt
-            q_queue.put(prompt)
+        sess["stage"] = "DISCOVERY"
+        q_queue.put(DISCOVERY_QUESTIONS.get(lang, DISCOVERY_QUESTIONS["hi"]))
         return
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -1772,21 +2219,77 @@ async def process_utterance(utter_bytes: bytes, ws, q_queue):
     printLogs(f"[USER] Whisper detected: {user_text}")
     await ws.send(f"TRANSCRIPT:USER:{user_text}")
 
-      # Intent handling
+    # ── Multi-intent + sentiment update (every turn after lang gate) ──────────
+    intents      = detect_multi_intent(user_text, top_k=3)
+    primary_intent = intents[0][0] if intents else "neutral"
+    new_sentiment  = detect_sentiment(user_text)
+    sess["sentiment"] = new_sentiment
+    update_lead_score_components(sess, intents, new_sentiment)
+    compute_lead_score(sess)
+    printLogs(f"[STAGE] {sess.get('stage','QUALIFICATION')} | primary={primary_intent} | sentiment={new_sentiment} | score={sess.get('lead_score_total',0):.1f}")
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # Intent handling (single-intent for recall + questionnaire paths)
     intent = detect_intent_with_chroma(user_text)
-    
+
     ##############################################
-    # Handle recall intents first
+    # Handle recall intents first (works in any stage)
     if intent.startswith("recall_"):
         field = intent.replace("recall_", "")
         if field in sess.get("answers", {}):
-            await recall_and_confirm(field, sess["answers"][field], q_queue)
+            await recall_and_confirm(field, sess["answers"][field], q_queue, lang)
         else:
-            q_queue.put(f"मुझे अभी तक आपका {FIELD_NAMES_HINDI.get(field, 'यह')} जानकारी नहीं मिली है")
+            q_queue.put(S("no_info_yet", lang, FIELD_NAMES_HINDI.get(field, field)))
         return
     ##############################################
 
-    # Intent handling
+    # ── Stage-based routing for non-QUALIFICATION stages ─────────────────────
+    stage = sess.get("stage", "QUALIFICATION")
+    if stage in ("DISCOVERY", "PITCH", "OBJECTION_HANDLING", "CTA", "HANDOFF", "END"):
+        # Capture persona from lead data or answers once DISCOVERY gives us a profession
+        if not sess.get("persona"):
+            prof = (sess.get("answers", {}).get("profession") or
+                    sess.get("lead_data", {}).get("profession", ""))
+            if prof:
+                sess["persona"] = prof
+
+        # Track new-style objection list (for scoring + GPT context)
+        if primary_intent.startswith("obj_"):
+            existing_types = [o["type"] for o in sess.get("objections", [])]
+            if primary_intent not in existing_types:
+                sess.setdefault("objections", []).append({"type": primary_intent, "resolved": False})
+            if primary_intent not in sess.get("objections_raised", []):
+                sess.setdefault("objections_raised", []).append(primary_intent)
+
+        # Cancel check in any stage
+        if primary_intent == "cancel":
+            try:
+                with q_queue.mutex:
+                    q_queue.queue.clear()
+                    q_queue.all_tasks_done.notify_all()
+                    q_queue.unfinished_tasks = 0
+            except Exception:
+                while not q_queue.empty():
+                    try: q_queue.get_nowait()
+                    except queue.Empty: break
+            q_queue.put(S("cancel_bye", lang))
+            await ws.send("FLOW_CANCELLED")
+            return
+
+        generate_text_and_audio_gpt(user_text, ws, q_queue)
+        advanced = advance_stage(sess, primary_intent, new_sentiment)
+
+        # When stage just advanced to QUALIFICATION, bootstrap the questionnaire
+        if advanced and sess.get("stage") == "QUALIFICATION":
+            sess["intent_confirmed"] = True
+            existing_answers = sess.get("answers", {})
+            if not sess.get("unanswered_required"):
+                sess["unanswered_required"] = [q["id"] for q in QUESTIONNAIRE if q.get("required") and q["id"] not in existing_answers]
+                sess["unanswered_optional"] = [q["id"] for q in QUESTIONNAIRE if not q.get("required") and q["id"] not in existing_answers]
+        return
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # Intent handling (QUALIFICATION stage — original logic)
     if not sess["intent_confirmed"]:
         intent_start = time.perf_counter()
         isIntent = await handle_intent(user_text, ws, sess, q_queue)
@@ -1801,7 +2304,7 @@ async def process_utterance(utter_bytes: bytes, ws, q_queue):
                 # Clear queue before cancellation message
                 while not q_queue.empty():
                     q_queue.get()
-                q_queue.put("अपना समय देने के लिए धन्यवाद। आपका दिन शुभ हो।")
+                q_queue.put(S("cancel_bye", sess.get("lang", "hi") if sess else "hi"))
                 await ws.send("FLOW_CANCELLED")
 
                 # Clear session data
@@ -1902,7 +2405,6 @@ async def process_utterance(utter_bytes: bytes, ws, q_queue):
                 printLogs(f"[DEBUG] unanswered_required: {sess['unanswered_required']}")
                 printLogs(f"[DEBUG] unanswered_optional: {sess['unanswered_optional']}")
             if "default" in extracted and extracted["default"] == "invalid":
-                await ws.send("FILLER:ask_again")
                 return
 
 
@@ -1920,8 +2422,8 @@ async def process_utterance(utter_bytes: bytes, ws, q_queue):
                 printLogs("[INFO] Re-asking last question due to repeated 'interested' intent.")
                 lang = sess.get("lang", "hi")
                 prompt = qprompt(current_q, lang)
-                sess["last_asked_text"] = S("resume_journey", lang, prompt)
-                q_queue.put(sess["last_asked_text"])
+                sess["last_asked_text"] = prompt
+                q_queue.put(prompt)
                 return
             else:
                 # No question asked yet — ask the first unanswered question
@@ -1973,7 +2475,7 @@ async def process_utterance(utter_bytes: bytes, ws, q_queue):
             lang = sess.get("lang", "hi")
             if intent not in sess.get("objections_raised", []):
                 sess.setdefault("objections_raised", []).append(intent)
-            rebuttal = OBJECTION_REBUTTALS.get(intent)
+            rebuttal = get_rebuttal(intent, lang)
             if rebuttal:
                 q_queue.put(rebuttal)
             # Re-ask the current question after rebuttal
@@ -1993,21 +2495,16 @@ async def process_utterance(utter_bytes: bytes, ws, q_queue):
 
             if sess.get("last_answer_was_general_enquiry"):
                 printLogs("[INFO] Confusion after general_enquiry. Re-invoking GPT - 1")
-                #sess["last_answer_was_general_enquiry"] = False  # Reset #TODO: IF THIS NEEDS TO BE DONE
-
                 printLogs(f"[INFO] last user text : {sess.get('last_user_text', '')}")
-
-                # Trigger GPT response again
-                generate_text_and_audio_gpt(sess["last_user_text"], ws, q_queue)  ## Aditya come here
-                await ws.send(f"FILLER:back_to_buy")
+                generate_text_and_audio_gpt(sess["last_user_text"], ws, q_queue)
                 lang = sess.get("lang", "hi")
                 prompt = qprompt(current_q, lang)
-                q_queue.put(S("resume_journey", lang, prompt))
+                q_queue.put(prompt)
                 sess["last_asked_text"] = prompt
             else:
                 lang = sess.get("lang", "hi")
                 prompt = qprompt(current_q, lang)
-                q_queue.put(S("repeat_q", lang, prompt))
+                q_queue.put(prompt)
                 sess["last_asked_text"] = prompt
 
             return
@@ -2057,7 +2554,7 @@ async def process_utterance(utter_bytes: bytes, ws, q_queue):
                 lang = sess.get("lang", "hi")
 
                 if qid == "name":
-                    q_queue.put(S("thanks_name", lang, value))
+                    pass
 
                 elif qid == "profession":
                     if value == "not_found":
@@ -2065,7 +2562,7 @@ async def process_utterance(utter_bytes: bytes, ws, q_queue):
                         if "profession" not in sess["unanswered_required"]:
                             sess["unanswered_required"].append("profession")
                     elif len(extracted) == 1:
-                        await ws.send("FILLER:noted")
+                        pass
 
                 elif qid == "network_size":
                     try:
@@ -2076,7 +2573,7 @@ async def process_utterance(utter_bytes: bytes, ws, q_queue):
                         if "network_size" in sess["unanswered_required"]:
                             sess["unanswered_required"].remove("network_size")
                         if len(extracted) == 1:
-                            await ws.send("FILLER:noted")
+                            pass
                     except (ValueError, TypeError):
                         sess["answers"].pop("network_size", None)
                         if "network_size" not in sess["unanswered_required"]:
@@ -2091,7 +2588,7 @@ async def process_utterance(utter_bytes: bytes, ws, q_queue):
                         if "city" not in sess["unanswered_required"]:
                             sess["unanswered_required"].append("city")
                     elif len(extracted) == 1:
-                        await ws.send("FILLER:noted")
+                        pass
 
                 elif qid == "current_broker":
                     sess["answers"]["current_broker"] = value
@@ -2111,7 +2608,7 @@ async def process_utterance(utter_bytes: bytes, ws, q_queue):
                         if "phone" in sess["unanswered_required"]:
                             sess["unanswered_required"].remove("phone")
                         if len(extracted) == 1:
-                            await ws.send("FILLER:noted")
+                            pass
                     else:
                         sess["answers"].pop("phone", None)
                         if "phone" not in sess["unanswered_required"]:
@@ -2122,7 +2619,7 @@ async def process_utterance(utter_bytes: bytes, ws, q_queue):
 
                 else:
                     if len(extracted) == 1:
-                        await ws.send("FILLER:noted")
+                        pass
 
             # Move to next question
             next_q = get_next_question(sess)
@@ -2142,21 +2639,36 @@ async def process_utterance(utter_bytes: bytes, ws, q_queue):
                     summary["transcript"] = SESSION_CONVERSATION.get(session_id, [])
                     lead_score = summary["lead_score"]
                     lang = sess.get("lang", "hi")
-                    phone = sess["answers"].get("phone", "")
-                    name  = sess["answers"].get("name", "")
 
+                    # English closings come from scripts.json; other languages
+                    # fall back to local copies for now (JSON has en/hi/hinglish only).
                     closing = {
                         "Hot": {
-                            "hi": f"{name} ji, bahut badhiya! Aapka profile ek dedicated RM ke paas bhej raha hoon — woh jald hi contact karenge.",
-                            "en": f"Excellent {name}! Connecting you with a dedicated RM who will reach out shortly.",
+                            "en": KB_SCRIPTS.get("hot_closing", "Connecting you with a dedicated RM who will reach out shortly."),
+                            "hi": "Aapka profile ek dedicated RM ke paas bhej raha hoon — woh jald hi contact karenge.",
+                            "ta": "Ungal profile-ai oru dedicated RM kita anuppuren — avar viraivil thodarbu kolvar.",
+                            "te": "Mee profile ni oka dedicated RM ki pampistunna — atanu twaralo sampradistadu.",
+                            "mr": "Tumcha profile dedicated RM kade pathavto — te lavkarach sampark karteel.",
+                            "gu": "Tamaru profile dedicated RM ne mokli rahyo chu — te jaldi sampark karshe.",
+                            "bn": "Apnar profile ekjon dedicated RM-ke pathiye dichhi — tini shighro jogajog korben.",
                         },
                         "Warm": {
-                            "hi": f"{name} ji, thanks! Aapke WhatsApp par sign-up link bhej raha hoon — apni speed se dekh lena.",
-                            "en": f"Thanks {name}! Sending you the sign-up link on WhatsApp.",
+                            "en": KB_SCRIPTS.get("warm_closing", "Sending the sign-up link to your WhatsApp now."),
+                            "hi": "Aapke WhatsApp par sign-up link bhej raha hoon — apni speed se dekh lena.",
+                            "ta": "Ungal WhatsApp-ku sign-up link anuppuren — neram irukkum bothu paarungal.",
+                            "te": "Mee WhatsApp ki sign-up link pampistunna — meeku samayam vunnapudu choodandi.",
+                            "mr": "Tumchya WhatsApp var sign-up link pathavto — vela milel tevha bagha.",
+                            "gu": "Tamara WhatsApp par sign-up link mokli rahyo chu — samay male tyare jojo.",
+                            "bn": "Apnar WhatsApp-e sign-up link pathachhi — somoy mato dekhe niben.",
                         },
                         "Cold": {
-                            "hi": f"{name} ji, bilkul samjha. Kuch dino mein ek updated offer ke saath wapas aaunga.",
-                            "en": f"Understood {name}. We will reach out again in a few days.",
+                            "en": KB_SCRIPTS.get("cold_closing", "We will reach out again in a few days with an updated offer."),
+                            "hi": "Kuch dino mein ek updated offer ke saath wapas aaunga.",
+                            "ta": "Sila naatkalil oru puthiya offer-udan thodarbu kolvom.",
+                            "te": "Konni rojulalo kotta offer tho marala sampradistamu.",
+                            "mr": "Kahi divsanni updated offer gheun parat sampark karu.",
+                            "gu": "Thoda divso ma updated offer sathe pacha sampark karishu.",
+                            "bn": "Kichu diner moddhe notun offer niye abar jogajog korbo.",
                         },
                     }
                     msg = closing[lead_score].get(lang, closing[lead_score]["hi"])
@@ -2178,7 +2690,6 @@ async def process_utterance(utter_bytes: bytes, ws, q_queue):
                     else:
                         await ws.send(f"NURTURE_LEAD:{json.dumps(summary, ensure_ascii=False)}")
 
-                    await ws.send("FILLER:flow_complete")
                 except Exception as e:
                     printLogs(f"[ERROR] During lead scoring/routing: {e}")
                     traceback.print_exc()
@@ -2235,17 +2746,12 @@ async def process_utterance(utter_bytes: bytes, ws, q_queue):
                 if answer == "general_enquiry":
                     printLogs("[INFO] General enquiry detected.")
                     playContinueJourney = True
-                    sess["last_answer_was_general_enquiry"] = True 
-                    # Clear queue before handling enquiry
-                    await ws.send("PLAY_FILLER")
-                    # while not q_queue.empty():
-                    #     q_queue.get()
+                    sess["last_answer_was_general_enquiry"] = True
                     generate_text_and_audio_gpt(user_text, ws, q_queue)
                     lang = sess.get("lang", "hi")
                     prompt = qprompt(current_q, lang)
-                    sess["last_asked_text"] = S("resume_journey", lang, prompt)
-                    q_queue.put(sess["last_asked_text"]) # TODO: Check if this works as expected.
-
+                    sess["last_asked_text"] = prompt
+                    q_queue.put(prompt)
                     return
 
                 elif answer not in ("not_found", "not_an_answer", "invalid", "not_insurance", "not_relevant", "confused"):
@@ -2265,8 +2771,6 @@ async def process_utterance(utter_bytes: bytes, ws, q_queue):
                         return
 
                 elif answer in ["invalid", "not_insurance", "not_relevant"]:
-                    printLogs("Going to send ask_again flag to frontend")
-                    await ws.send("FILLER:ask_again")
                     lang = sess.get("lang", "hi")
                     sess["last_asked_text"] = qprompt(current_q, lang)
                     return
@@ -2281,12 +2785,8 @@ async def process_utterance(utter_bytes: bytes, ws, q_queue):
                     if sess.get("last_answer_was_general_enquiry"):
                         printLogs("[INFO] Confusion after general_enquiry. Re-invoking GPT - 2")
                         generate_text_and_audio_gpt(sess["last_user_text"], ws, q_queue)
-                        q_queue.put(S("resume_confused", lang, prompt))
-                        sess["last_asked_text"] = prompt
-                    else:
-                        q_queue.put(S("repeat_q", lang, prompt))
-                        sess["last_asked_text"] = prompt
-
+                    q_queue.put(prompt)
+                    sess["last_asked_text"] = prompt
                     return
 
                 # elif answer == "continue_journey":
@@ -2304,7 +2804,6 @@ async def process_utterance(utter_bytes: bytes, ws, q_queue):
             printLogs(f"[WARN] No valid answer for {current_qid}, re-asking")
             while not q_queue.empty():
                 q_queue.get()
-            await ws.send("FILLER:re_asking")
             lang = sess.get("lang", "hi")
             prompt = qprompt(current_q, lang)
             sess["last_asked_text"] = prompt
@@ -2312,17 +2811,12 @@ async def process_utterance(utter_bytes: bytes, ws, q_queue):
             return
         
         elif "default" in extractedObj and extractedObj["default"] in ("not_insurance", "not_relevant"):
-            await ws.send("FILLER:ask_again")
             #generate_text_and_audio_gpt(user_text, ws, q_queue)  ## Aditya come here
             #q_queue.put(f"चलिए आपकी अधूरी यात्रा को शुरू करते हैं। {current_q['prompt']}")
             return
 
-    # Fallback to chit-chat
+    # Fallback to chit-chat — let the LLM drive the next turn end-to-end (no hardcoded follow-up filler)
     printLogs("[INFO] Fallback to ordinary chit-chat")
-    await ws.send("PLAY_FILLER")
-    # Clear queue before chit-chat
-    # while not q_queue.empty():
-    #     q_queue.get()
     gpt_done_event = threading.Event()
     threadObj = threading.Thread(
         target=generate_text_and_audio_gpt,
@@ -2332,12 +2826,6 @@ async def process_utterance(utter_bytes: bytes, ws, q_queue):
     )
     threadObj.start()
     gpt_done_event.wait()
-    lang = get_session(ws).get("lang", "hi")
-    followup = {
-        "en": "Just to circle back — are you open to exploring the Rupeezy AP partner opportunity?",
-        "hi": "Main aapko bata dun — Rupeezy AP program mein zero joining fee hai, 100% brokerage share milta hai, aur daily payouts hote hain. Kya aap iske baare mein aur sunna chahenge?",
-    }.get(lang, "Main aapko bata dun — Rupeezy AP program mein zero joining fee hai, 100% brokerage share milta hai, aur daily payouts hote hain. Kya aap iske baare mein aur sunna chahenge?")
-    q_queue.put(followup)
 
 def prepareConversationHistory(sess, QUESTIONNAIRE):
     history = []
@@ -2373,15 +2861,19 @@ def prepareConversationHistory(sess, QUESTIONNAIRE):
 # --------------------------
 # LLM streaming helper
 # --------------------------
-def generate_text_and_audio_gpt(user_text: str, ws, q_queue: queue.Queue,voice=None,gpt_done_event=None):   
+def generate_text_and_audio_gpt(user_text: str, ws, q_queue: queue.Queue, voice=None, gpt_done_event=None):
     sess = get_session(ws)
     sess["last_user_text"] = user_text
 
-    '''
-    you are dhvani, a female who helps people buy insurance. Be friendly, cheerful, concise, no bullet points. Try and figure out the best possible meaning of the answer given by user, in context, to the previous asked question. only hinglish is allowed. Don't use filler words like "bilkul" to begin with. Should not end with a question and only answer insurance related questions 
-    (health).
-    '''
-    lang = sess.get("lang", "hi")
+    lang         = sess.get("lang", "hi")
+    stage        = sess.get("stage", "QUALIFICATION")
+    persona      = sess.get("persona") or sess.get("answers", {}).get("profession", "") or sess.get("lead_data", {}).get("profession", "")
+    sentiment    = sess.get("sentiment", "neutral")
+    score        = sess.get("lead_score_total", 0)
+    lead_gender  = sess.get("gender", "male")
+    objections   = sess.get("objections", [])
+    unresolved   = [o["type"].replace("obj_", "").replace("_", " ") for o in objections if not o.get("resolved")]
+
     lang_instruction = {
         "en": "Reply ONLY in English.",
         "hi": "Reply ONLY in Hinglish (Hindi + English mix). No bullet points.",
@@ -2392,36 +2884,51 @@ def generate_text_and_audio_gpt(user_text: str, ws, q_queue: queue.Queue,voice=N
         "bn": "Reply ONLY in Bengali. No bullet points.",
     }.get(lang, "Reply in Hinglish.")
 
-    lead_gender   = sess.get("gender", "male")
-    gender_note   = (
-        "The lead is female — use feminine pronouns and gender-appropriate verb forms when referring to her. "
+    gender_note = (
+        "The lead is female — use feminine pronouns and gender-appropriate verb forms. "
         if lead_gender == "female" else
-        "The lead is male — use masculine pronouns and gender-appropriate verb forms when referring to him. "
+        "The lead is male — use masculine pronouns and gender-appropriate verb forms. "
     )
 
+    stage_instr  = STAGE_INSTRUCTIONS.get(stage, STAGE_INSTRUCTIONS["QUALIFICATION"])
+    persona_ctx  = PERSONA_PITCH.get(persona, PERSONA_PITCH["default"])
+    rag_context  = retrieve_rag_context(user_text, persona)
+
+    score_guidance = (
+        "Lead is close to converting — gently push toward CTA (WhatsApp link or confirm callback)."
+        if score >= 60 else
+        "Build trust and demonstrate value before pushing for action."
+    )
+
+    obj_note = (
+        f"Unresolved objections on record: {', '.join(unresolved)}. Address naturally if raised again. "
+        if unresolved else ""
+    )
+
+    rag_note = f"RELEVANT KNOWLEDGE: {rag_context} " if rag_context else ""
+
+    sentiment_guide = {
+        "high_intent":  "Lead is highly motivated — move toward CTA immediately.",
+        "positive":     "Lead is receptive — build on momentum.",
+        "hesitant":     "Lead is hesitant — validate their concern, reduce perceived risk.",
+        "confused":     "Lead seems confused — simplify, use an analogy.",
+        "frustrated":   "Lead is frustrated — de-escalate, don't push product yet.",
+        "neutral":      "Neutral tone — keep engaging naturally.",
+    }.get(sentiment, "")
+
     system_instruction = (
-        "You are Priya, a senior partner executive at Rupeezy — a SEBI-registered stockbroker. "
-        "Your job is to pitch Rupeezy's Authorized Person (AP) partner program to leads who are "
-        "MFDs, financial advisors, insurance agents, or finance influencers. "
+        f"{KB_SYSTEM_PROMPT} "
         f"{gender_note}"
-        "CORE BENEFITS to weave in naturally: "
-        "(1) Zero joining fee — no upfront cost ever. "
-        "(2) 100% brokerage share — vs 60-70% industry standard. "
-        "(3) Daily payouts via RISE Portal — no waiting till month-end. "
-        "(4) SEBI-registered broker — fully regulated and trustworthy. "
-        "(5) Dedicated RM support — full hand-holding from onboarding to first payout. "
-        "OBJECTION HANDLING RULES: "
-        "If lead says they are already with another broker — frame Rupeezy as ADDITIVE, not a replacement. "
-        "If lead has few contacts — reassure that even 5-10 active contacts are enough to start. "
-        "If lead asks about support — emphasise the dedicated RM layer, not a generic helpline. "
-        "If lead doubts trustworthiness — cite SEBI registration and offer to share certificate. "
-        "If lead says 'think about it' — offer to send WhatsApp signup link; joining is free so risk is zero. "
-        "TONE & FORMAT: Friendly, confident, sales-oriented. Never use bullet points. "
-        "Keep responses under 60 words. Do NOT start with filler words like 'bilkul' or 'sure'. "
-        "Do NOT end responses with a question unless collecting a required detail. "
-        "Never make unverifiable claims about company size, revenue, or guaranteed earnings. "
-        "If asked about earnings, say active APs average ₹20,000–₹1,00,000/month with no cap. "
-        "Always guide towards: sign up via WhatsApp link, or confirm callback time. "
+        f"CURRENT STAGE: {stage}. YOUR GOAL THIS TURN: {stage_instr} "
+        f"LEAD PERSONA: {persona}. PERSONA CONTEXT: {persona_ctx} "
+        f"LEAD SENTIMENT: {sentiment}. SENTIMENT GUIDE: {sentiment_guide} "
+        f"LEAD SCORE: {score:.0f}/100. {score_guidance} "
+        f"{obj_note}"
+        f"{rag_note}"
+        f"{BENEFITS_BLOCK} "
+        f"{COMPLIANCE_BLOCK} "
+        "TONE: Friendly, confident, conversational. Never use bullet points. "
+        "Under 60 words per response. Do NOT start with 'bilkul', 'sure', or 'of course'. "
         f"{lang_instruction}"
     )
 
@@ -2573,8 +3080,8 @@ async def audio_handler(ws):
     intro_template = INTRO_TEXTS.get(lang, INTRO_TEXTS["hi"])
     intro_text = intro_template.format(name=name_part)
     q_queue.put(intro_text)
-    # Language preference question — ask after intro
-    q_queue.put(LANG_CONFIRM_Q.get(lang, LANG_CONFIRM_Q["hi"]))
+    # No upfront language-confirmation TTS — language is locked from lead metadata.
+    # Mid-call language switches are detected silently in process_utterance.
     # ─────────────────────────────────────────────────────────────────────────
 
     try:
@@ -2601,7 +3108,7 @@ async def audio_handler(ws):
                     break
                 else:
                     utt_buf.clear()
-                
+
                 read_buf.extend(data)
                 # ------------------------------------------
 
@@ -2613,6 +3120,26 @@ async def audio_handler(ws):
 
                     if speech:                             # ── we're inside speech
                         if not in_speech:                  # ① transition silence→speech
+                            # ── TTS interrupt: user started speaking during bot TTS ──────
+                            tts_sess = SESSIONS.get(sessionId, {})
+                            if tts_sess.get("tts_active"):
+                                cancel_ev = tts_sess.get("tts_cancel")
+                                if cancel_ev:
+                                    cancel_ev.set()
+                                # Drain pending TTS text queue
+                                try:
+                                    with q_queue.mutex:
+                                        q_queue.queue.clear()
+                                        q_queue.all_tasks_done.notify_all()
+                                        q_queue.unfinished_tasks = 0
+                                except Exception:
+                                    while not q_queue.empty():
+                                        try: q_queue.get_nowait()
+                                        except queue.Empty: break
+                                # Tell client to stop playing audio immediately
+                                asyncio.run_coroutine_threadsafe(ws.send("STOP_AUDIO"), loop)
+                                printLogs("[VAD] Interrupt — user spoke during TTS; cancelled.")
+                            # ────────────────────────────────────────────────────────────
                             utt_buf.extend(b"".join(pre_roll))  # prepend the 3 stored frames
                             pre_roll.clear()
                             in_speech, silent = True, 0
